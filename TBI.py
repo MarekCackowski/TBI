@@ -262,8 +262,8 @@ class ColumnDropper(BaseEstimator, TransformerMixin):
 
 
 class MedicalCascadePredictor:
-    """ Zoptymalizowana kaskada decyzyjna. Wykorzystuje wektoryzację zamiast pętli,
-        co drastycznie przyspiesza działanie SHAP i inference. """
+    """ Zoptymalizowana kaskada decyzyjna. Wykorzystuje wektoryzację zamiast pętli.
+        Zaktualizowana o precyzyjną bramkę kliniczną z fuzją Log-Odds. """
     def __init__(self, preprocessor, ensemble, specialist, judge):
         self.preprocessor = preprocessor
         self.ensemble = ensemble
@@ -298,9 +298,33 @@ class MedicalCascadePredictor:
             # Aktywacja SVM
             prob_spec = self.specialist.predict_proba(X_hard)[:, 1]
 
-            # Fuzja dla regresji
-            meta_features = np.column_stack((prob_main[is_hard_case], prob_spec))
-            prob_final_hard = self.judge.predict_proba(meta_features)[:, 1]
+            # Fuzja kliniczna
+            eps = 1e-6
+            p_main_hard = np.clip(prob_main[is_hard_case], eps, 1 - eps)
+            p_spec_hard = np.clip(prob_spec, eps, 1 - eps)
+
+            # Obliczamy niepewność modelu głównego
+            uncertainty = 1 - 2 * np.abs(p_main_hard - 0.5)
+
+            # Obliczamy beznadziejność stanu używając aktualnych nazw kolumn
+            eyes_val = pd.to_numeric(X_hard['gcs_eyes'], errors='coerce').fillna(4.0)
+            severity_score = (eyes_val == 1.0).astype(int) + (X_hard['is_intubated'] == 1.0).astype(int)
+
+            # Dynamiczna funkcja wagi
+            base_w_spec = np.where(severity_score == 2, 0.85,
+                                   np.where(severity_score == 1, 0.65, 0.0))
+
+            dynamic_w_spec = base_w_spec + (uncertainty * 0.1)
+            dynamic_w_spec = np.clip(dynamic_w_spec, 0, 0.95)
+
+            # Fuzja w przestrzeni Logit
+            logit_main = logit(p_main_hard)
+            logit_spec = logit(p_spec_hard)
+
+            final_logit = (1 - dynamic_w_spec) * logit_main + dynamic_w_spec * logit_spec
+
+            # Powrót do prawdopodobieństwa poprzez funkcję expit
+            prob_final_hard = expit(final_logit)
 
             # Ostateczny werdykt
             final_probs[is_hard_case] = prob_final_hard
@@ -313,8 +337,8 @@ class MedicalCascadePredictor:
 
 
 def load_and_split_data():
-    """ Pobiera dane z Postgres, ze wskazaniem źródła kolumn. """
-    conn = psycopg2.connect(host="localhost", port=5433, database="hospital_db", user="postgres", password="postgres")
+    """ Pobiera dane z Postgres i od razu wylicza nowe markery medyczne. """
+    conn = psycopg2.connect(host=DB_HOST, port=5433, database="hospital_db", user="postgres", password="postgres")
 
     query = """ SELECT 
                     c.gcs_eyes,
@@ -324,14 +348,14 @@ def load_and_split_data():
                     c.heart_rate_max,
                     c.spo2_min,
                     c.glucose_max,
-                    c.d1_glucose_max, -- Potrzebne do glucose_stress
-                    c.d1_sysbp_max, -- Potrzebne do cushing_risk_index
-                    c.d1_heartrate_min, -- Potrzebne do cushing_risk_index
-                    c.d1_diasbp_min, -- Potrzebne do map_min
+                    c.d1_glucose_max, 
+                    c.d1_sysbp_max, 
+                    c.d1_heartrate_min, 
+                    c.d1_diasbp_min, 
                     c.age,
                     c.is_intubated,
-                    c.ventilated_apache, -- Potrzebne do sedation_risk_flag
-                    c.apache_3j_bodysystem, -- Potrzebne do baseline_neuro_deficit
+                    c.ventilated_apache, 
+                    c.apache_3j_bodysystem, 
                     v.hospital_outcome_death as label
                 FROM Clinical_Measurements_Temporal c
                 JOIN Visits v ON c.patient_id = v.patient_id
@@ -340,12 +364,23 @@ def load_and_split_data():
     df = pd.read_sql(query, conn)
     conn.close()
 
+    # Odtwarzamy cechy interakcyjne
+    df['eyes_to_motor_ratio'] = pd.to_numeric(df['gcs_eyes'], errors='coerce') / (
+            pd.to_numeric(df['gcs_motor'], errors='coerce') + 1)
+
+    # Skomplikowane załamanie pnia mózgu (brak reakcji ruchowej u intubowanego)
+    df['brainstem_failure_risk'] = ((df['is_intubated'] == 1) &
+                                    (pd.to_numeric(df['gcs_motor'], errors='coerce') <= 2)).astype(int)
+
+    # Indeks hipoksji wstrząsowej (niskie ciśnienie + niskie natlenienie)
+    df['hypoxia_shock_index'] = pd.to_numeric(df['sysbp_min'], errors='coerce') * pd.to_numeric(df['spo2_min'],
+                                                                                                errors='coerce')
+
     # Usuwamy label z X i przypisujemy do y
     X = df.drop(columns=['label'])
     y = df['label'].fillna(0).astype(int)
 
     print(f"Zaciągnięto {len(df)} rekordów. Cechy: {list(X.columns)}")
-    # Stratyfikacja po label zapewnia, że w obu zbiorach będzie tyle samo % zgonów
     return train_test_split(X, y, test_size=0.2, stratify=y, random_state=42)
 
 
