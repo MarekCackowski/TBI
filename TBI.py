@@ -8,6 +8,9 @@ from pymongo import MongoClient
 import psycopg2
 import redis
 
+# Funkcje do przekształcania prawdopodobieństw
+from scipy.special import logit, expit
+
 # Połączenia z infrastrukturą Docker itd.
 DB_HOST = os.getenv('DB_HOST', 'localhost')
 MONGO_HOST = os.getenv('MONGO_HOST', 'localhost')
@@ -717,7 +720,6 @@ if __name__ == "__main__":
     specialist_model = SVC(
         kernel='rbf',
         probability=True,
-        class_weight='balanced',
         random_state=42,
         max_iter=10000,
         cache_size=5000
@@ -761,10 +763,10 @@ if __name__ == "__main__":
     # Generujemy predykcje
     y_prob_base = ensemble.predict_proba(X_test_clean_df)[:, 1]
     auc_base = roc_auc_score(y_test, y_prob_base)
-    print(f"Wynik Monolitu (XGB+LGBM) bez optymalizacji AUC: {auc_base:.4f}")
+    print(f"Wynik Monolitu (XGB+LGBM+RF) bez optymalizacji AUC: {auc_base:.4f}")
 
     # Optymalizacja Bayesowska silników modeli
-    print("Rozpoczynam naukę Bayesowską XGB+LGBM (Turniej Halving).")
+    print("Rozpoczynam naukę Bayesowską XGB+LGBM+RF (Turniej Halving).")
 
     # Przygotowujemy scorer. Beta=1.5 oznacza, że Recall (czułość) jest ważniejszy od Precision.
     SAFE_SCORER = make_scorer(fbeta_score, beta=1.5)
@@ -774,15 +776,15 @@ if __name__ == "__main__":
         # Ekspert Hemodynamiczny (LightGBM)
         'internist__model__n_estimators': randint(500, 2000),
         'internist__model__learning_rate': loguniform(0.005, 0.2),
-        'internist__model__num_leaves': randint(20, 150),
-        'internist__model__scale_pos_weight': loguniform(1.0, 20.0),
+        'internist__model__num_leaves': randint(20, 60),
+        'internist__model__scale_pos_weight': loguniform(1.0, 8.0),
 
         # Ekspert Geriatryczny (XGBoost)
         'geriatrist__model__n_estimators': randint(500, 2000),
         'geriatrist__model__learning_rate': loguniform(0.005, 0.2),
-        'geriatrist__model__max_depth': randint(3, 9),
-        'geriatrist__model__min_child_weight': randint(1, 10),
-        'geriatrist__model__scale_pos_weight': loguniform(1.0, 15.0),
+        'geriatrist__model__max_depth': randint(3, 7),
+        'geriatrist__model__min_child_weight': randint(1, 5),
+        'geriatrist__model__scale_pos_weight': loguniform(1.0, 8.0),
 
         # Sędzia (Meta-model: Regresja Logistyczna)
         'final_estimator__C': loguniform(0.001, 1.0)
@@ -798,7 +800,7 @@ if __name__ == "__main__":
                           any(x in col.lower() for x in ['age', 'efficiency', 'geriatric'])]
 
     # Bazowy model dla eksperta neurologicznego wewnątrz Konsylium
-    specialist_model = SVC(kernel='rbf', probability=True, class_weight='balanced', random_state=42, max_iter=10000, cache_size=5000)
+    specialist_model = SVC(kernel='rbf', probability=True, random_state=42, max_iter=10000, cache_size=5000)
 
     # Pakujemy wyizolowane dane i modele w rury
     hemo_expert = Pipeline([
@@ -851,10 +853,10 @@ if __name__ == "__main__":
         n_candidates=500,
         factor=3,
         resource='n_samples',
-        min_resources=5000,  # Zaczynamy turniej od min. 5000 pacjentów
-        cv=StratifiedKFold(n_splits=3, shuffle=True, random_state=42), # Wymuszenie proporcji
+        min_resources=5000, # Zaczynamy turniej od 5000 pacjentów
+        cv=StratifiedKFold(n_splits=3, shuffle=True, random_state=42),
         n_jobs=-1,
-        scoring=SAFE_SCORER,
+        scoring='roc_auc',  # Model uczy się najlepiej sortować ryzyko
         random_state=42,
         verbose=1
     )
@@ -911,7 +913,7 @@ if __name__ == "__main__":
         resource='n_samples',
         min_resources=2000, # Zaczynamy od co najmniej 2000 pacjentów, żeby mieć pewność obu klas
         cv=StratifiedKFold(n_splits=5, shuffle=True, random_state=42),  # Wymuszamy proporcje klas i 5-krotna walidacja
-        scoring=SAFE_SCORER,
+        scoring='roc_auc',
         n_jobs=-1,
         random_state=42,
         verbose=1
@@ -1055,7 +1057,7 @@ if __name__ == "__main__":
     plt.savefig('models/calibration.png')
     plt.close()
 
-    geriatric_pipeline = ensemble.named_estimators_['geriatrist']
+    geriatric_pipeline = ensemble_best.named_estimators_['geriatrist']
     xgb_model = geriatric_pipeline.named_steps['model']  # Wyciągamy model z Pipeline
 
     if hasattr(xgb_model, "get_booster"):
@@ -1162,4 +1164,5 @@ print(f"Zysk z użycia Kaskady ML: {((model_bal_acc - gcs_bal_acc) * 100):.2f}% 
 # Przestawić moje HCR na analizę skanów mózgu: najpierw RSNA, potem do złączenia CQ-500
 r""" cd C:\TBI\database_model\patient-survival-prediction
      docker-compose up -d
-     docker exec -it hospital_postgres psql -U postgres -d hospital_db -c "SELECT count(*) FROM Patients;" """
+     docker exec -it hospital_postgres psql -U postgres -d hospital_db -c "SELECT count(*) FROM Patients;" 
+     python TBI.py """
