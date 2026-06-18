@@ -147,6 +147,33 @@ def save_to_infrastructure(patient_id, prob, decision, raw_data, vitals_snapshot
     print(f"Zapisano wynik dla pacjenta {patient_id} w SQL, Mongo i Redis.")
 
 
+def train_specialist_with_weights(X_train, y_train, konsylium_oof, lower_bound=0.25):
+    """ Kalkulacja wag dla Specjalisty i trening.
+        Większa waga dla pacjentów podwyższonego ryzyka. """
+    # Definicja maski dla trudnych/podejrzanych przypadków (odrzucamy tylko ewidentnie bezpiecznych)
+    uncertain_mask = (konsylium_oof > lower_bound)
+
+    # Inicjalizacja bazowych wag dla całego zbioru
+    sample_weights = np.ones(len(y_train))
+
+    # Łagodniejsze zwiększenie wagi dla pacjentów ze strefy ryzyka
+    sample_weights[uncertain_mask] = 1.5
+
+    print(f"Liczba pacjentów z priorytetem dla Specjalisty (waga 1.5): {np.sum(uncertain_mask)}")
+
+    # Inicjalizacja i trening modelu SVM z uwzględnieniem wag oraz wbudowanego balansu
+    svm_specialist = SVC(
+        kernel='rbf',
+        probability=True,
+        random_state=42,
+        max_iter=10000,
+        cache_size=5000,
+        class_weight='balanced'
+    )
+    svm_specialist.fit(X_train, y_train, sample_weight=sample_weights)
+
+    return svm_specialist
+
 def fine_tune_swa(stacking_model, X, y):
     """ Optymalizacja typu SWA dla meta-modelu. Polega na uśrednianiu wag regresji logistycznej z wielu
         podzbiorów danych w celu wyznaczenia stabilniejszej i lepiej zgeneralizowanej granicy decyzyjnej. """
@@ -876,78 +903,81 @@ if __name__ == "__main__":
 
     print(f"Ostateczny wynik Konsylium po optymalizacji AUC: {roc_auc_score(y_test, y_prob_main):.4f}")
 
-    """ Wyciągamy pacjentów wysokiego ryzyka, których model uznał za beznadziejne przypadki, jako
-        kandydaci do "Modelu Specjalisty" i ostrożnej rehabilitacji. """
-    train_probs = opt.predict_proba(X_train_clean_df)[:, 1]
-    X_spec_train = X_train[
-        (X_train['gcs_sum'] <= 8) | ((train_probs > 0.35) & (train_probs < 0.65))
-    ].copy()
+    """ Wyznaczamy szarą strefę i przygotowujemy wagi (Opcja 1 + Opcja 2: Error-Corrected Gating) """
+    train_probs_main = opt.predict_proba(X_train_clean_df)[:, 1]
 
-    # Dodajemy pewność modelu głównego jako nową cechę dla SVM
-    X_spec_train['model_1_prob'] = train_probs[X_train.index.get_indexer(X_spec_train.index)]
-    y_spec_train = y_train.loc[X_spec_train.index]
+    # 1. Definiujemy trudne przypadki (szara strefa Konsylium 15% - 85% lub GCS krytyczny)
+    uncertain_mask = (X_train['gcs_sum'] <= 8) | ((train_probs_main > 0.15) & (train_probs_main < 0.85))
 
-    # Preprocesor i Pipeline w jednym
+    # 2. Inicjalizacja bazowych wag dla całego zbioru
+    sample_weights = np.ones(len(y_train))
+    sample_weights[uncertain_mask] = 3.0  # SVM skupi się na tych pacjentach potrójnie
+
+    print(f"Liczba pacjentów z priorytetem dla Specjalisty (waga 3.0): {np.sum(uncertain_mask)}")
+
+    # 3. Dodajemy pewność modelu głównego jako nową cechę, ale tym razem na całym zbiorze
+    X_train_for_spec = X_train.copy()
+    X_train_for_spec['model_1_prob'] = train_probs_main
+
+    # Preprocesor i standardowy Pipeline (zastępujemy SMOTE wbudowanym w SVM class_weight='balanced')
     spec_prep = ColumnTransformer([
         ('num', Pipeline([('imp', SimpleImputer(strategy='constant', fill_value=-1)), ('sc', RobustScaler())]),
-         X_spec_train.select_dtypes(include='number').columns),
+         X_train_for_spec.select_dtypes(include='number').columns),
         ('cat',
          Pipeline([('imp', SimpleImputer(strategy='most_frequent')), ('oh', OneHotEncoder(handle_unknown='ignore'))]),
-         X_spec_train.select_dtypes(include='object').columns)
+         X_train_for_spec.select_dtypes(include='object').columns)
     ])
 
-    spec_pipe = ImbPipeline([('prep', spec_prep), ('smote', SMOTE(random_state=42)), ('svm', specialist_model)])
+    specialist_model = SVC(
+        kernel='rbf',
+        probability=True,
+        random_state=42,
+        max_iter=10000,
+        cache_size=5000,
+        class_weight='balanced'  # Odpowiada za wsparcie klasy zgonów
+    )
 
-    # Optymalizacja Bayesowska dla SVM
+    spec_pipe = Pipeline([('prep', spec_prep), ('svm', specialist_model)])
+
+    print(f"Rozpoczynam naukę Specjalisty SVM na CAŁYM zbiorze ({len(X_train_for_spec)} pacjentów) z korektą wagową.")
+
+    # Optymalizacja Bayesowska dla SVM (zmniejszono n_candidates z 250 do 50, bo uczymy na dużej macierzy)
     svm_search_space = {
         'svm__C': loguniform(0.1, 10),
-        'svm__gamma': loguniform(0.0001, 1),
-        'svm__kernel': ['rbf']
+        'svm__gamma': loguniform(0.0001, 1)
     }
 
     opt_spec = HalvingRandomSearchCV(
         spec_pipe,
         svm_search_space,
-        n_candidates=250, # Mniej danych
-        factor=2,  # Wolniejszy wzrost, bezpieczniejszy dla małych danych
+        n_candidates=50,
+        factor=2,
         resource='n_samples',
-        min_resources=2000, # Zaczynamy od co najmniej 2000 pacjentów, żeby mieć pewność obu klas
-        cv=StratifiedKFold(n_splits=5, shuffle=True, random_state=42),  # Wymuszamy proporcje klas i 5-krotna walidacja
+        min_resources=5000,
+        cv=StratifiedKFold(n_splits=3, shuffle=True, random_state=42),
         scoring='roc_auc',
         n_jobs=-1,
         random_state=42,
         verbose=1
     )
-    print(f"Rozpoczynam naukę Specjalisty SVM na {len(X_spec_train)} trudnych przypadkach.")
-
-    # Wyliczamy statystyki dla Specjalisty
-    spec_deaths = y_train.loc[X_spec_train.index].sum()
-    spec_total = len(X_spec_train)
-    spec_ratio = (spec_deaths / spec_total) * 100
-
-    print(f"Specjalista przejmuje {spec_total} przypadków.")
-    print(f"W tym {int(spec_deaths)} zgonów ({spec_ratio:.1f}% zbioru specjalisty).")
 
     with parallel_backend('threading'):
-        opt_spec.fit(X_spec_train, y_spec_train)
+        # HalvingRandomSearchCV operuje na obiekcie Pipeline. Przekazujemy argument 'sample_weight', żeby nie zgubił się po drodze.
+        opt_spec.fit(X_train_for_spec, y_train, svm__sample_weight=sample_weights)
 
-    # Kalibracja Specjalisty (żeby meta-model dostawał wiarygodne prawdopodobieństwa)
+    # Kalibracja Specjalisty (cv='prefit' zabezpiecza system przed zapomnieniem wag podczas re-treningu kalibratora)
     calibrated_spec = CalibratedClassifierCV(
         opt_spec.best_estimator_,
         method='isotonic',
-        cv=3
+        cv='prefit'
     )
-    calibrated_spec.fit(X_spec_train, y_spec_train)
+    calibrated_spec.fit(X_train_for_spec, y_train)
 
     print("Zapisywanie Specjalisty (SVM).")
     joblib.dump(calibrated_spec, 'models/SVM.pkl')
 
-    """ Po takim treningu modeli, możemy przejść do analizy wyników przez prostą regresję logistyczną dla
-        minimalizacji błędów. Proste modele są lepsze w medycynie, ze względu na Interpretowalność, Stabilność
-        (jest liniowa względem prawdopodobieństw) oraz ostateczną Kalibrację. """
     print("Przygotowanie modeli do ostatecznej fuzji.")
     try:
-        # Próbujemy użyć tego co w pamięci, jeśli nie ma - ładujemy
         if 'ensemble_best' not in locals():
             ensemble_best = joblib.load('models/XGB_LGBM.pkl')
         if 'calibrated_spec' not in locals():
@@ -958,13 +988,10 @@ if __name__ == "__main__":
 
     print("Synchronizacja ograniczeń medycznych dla XGBoosta (Ekspert Geriatryczny).")
 
-    # Wstrzykujemy dla XGBoost listę geriatric_constraints_list, a nie całość
     for est_list in [ensemble_best.estimators_, ensemble_best.estimators]:
         for item in est_list:
             name = item[0] if isinstance(item, tuple) else ""
             obj = item[1] if isinstance(item, tuple) else item
-
-            # Szukamy konkretnie rury Geriatry
             if isinstance(obj, Pipeline) and name == 'geriatrist':
                 inner_model = obj.named_steps['model']
                 if 'XGB' in str(type(inner_model)):
@@ -977,34 +1004,32 @@ if __name__ == "__main__":
 
     print("Generowanie predykcji OOF dla Sędziego.")
 
-    # OOF dla Konsylium (chroni sędziego przed naiwną wiarą w XGBoosta)
     y_prob_train_main_oof = cross_val_predict(
         ensemble_best, X_train_clean_df, y_train,
         cv=3, method='predict_proba', n_jobs=-1
     )[:, 1]
 
-    # Odtwarzamy maskę "Trudnych Przypadków" używając prawdziwych predykcji OOF
-    hard_mask = (X_train['gcs_sum'] <= 8) | ((y_prob_train_main_oof > 0.35) & (y_prob_train_main_oof < 0.65))
+    # Odtwarzamy szarą strefę za pomocą w pełni uczciwych prognoz Głównego
+    hard_mask_oof = (X_train['gcs_sum'] <= 8) | ((y_prob_train_main_oof > 0.15) & (y_prob_train_main_oof < 0.85))
 
-    # Inicjalizujemy wektor predykcji SVM (dla łatwych przypadków ufamy Konsylium)
+    # Inicjujemy predykcję Sędziego odkopując pewność z Konsylium dla łatwych diagnoz
     y_prob_train_spec_oof = y_prob_train_main_oof.copy()
 
-    # OOF dla Specjalisty SVM na trudnych przypadkach
-    if hard_mask.sum() > 0:
-        print(f"Wyliczanie OOF SVM dla {hard_mask.sum()} pacjentów.")
-        X_spec_train_oof = X_train[hard_mask].copy()
-        X_spec_train_oof['model_1_prob'] = y_prob_train_main_oof[hard_mask]
-        y_spec_train_oof = y_train[hard_mask]
+    if hard_mask_oof.sum() > 0:
+        print(f"Wyliczanie OOF SVM tylko dla {hard_mask_oof.sum()} pacjentów w szarej strefie.")
+        X_spec_train_oof = X_train[hard_mask_oof].copy()
+        X_spec_train_oof['model_1_prob'] = y_prob_train_main_oof[hard_mask_oof]
+        y_spec_train_oof = y_train[hard_mask_oof]
 
         y_prob_spec_hard_oof = cross_val_predict(
-            spec_pipe, X_spec_train_oof, y_spec_train_oof,
+            opt_spec.best_estimator_, X_spec_train_oof, y_spec_train_oof,
             cv=3, method='predict_proba', n_jobs=-1
         )[:, 1]
 
-        # Wstawiamy wyniki SVM w odpowiednie miejsca wektora głównego
-        y_prob_train_spec_oof[hard_mask] = y_prob_spec_hard_oof
+        # Podmieniamy wyniki tylko tam, gdzie zażądaliśmy interwencji specjalisty
+        y_prob_train_spec_oof[hard_mask_oof] = y_prob_spec_hard_oof
 
-    # Trening Sędziego (Meta-Model) na uczciwych danych OOF
+    # Trening Sędziego (Meta-Model)
     X_meta_train = np.column_stack((y_prob_train_main_oof, y_prob_train_spec_oof))
     final_judge = LogisticRegression(solver='lbfgs', C=0.01, max_iter=1000, class_weight='balanced', random_state=42)
     final_judge.fit(X_meta_train, y_train)
@@ -1142,7 +1167,7 @@ gcs_bal_acc = balanced_accuracy_score(y_test, y_gcs_baseline)
 # Wyświetlamy wyniki
 print(f"Dokładność (Accuracy): {gcs_acc:.4f}")
 print(f"Zbalansowana Dokładność: {gcs_bal_acc:.4f}")
-print("\nRaport klasyfikacji dla GCS <= 5:")
+print("Raport klasyfikacji dla GCS <= 5:")
 print(gcs_report)
 
 # Wizualizacja Macierzy Pomyłek dla GCS
