@@ -1,7 +1,7 @@
 # Traumatic Brain Injury Risk-Stratification System
 
 ## Project Overview
-This repository contains a production-ready **Multimodal Decision Cascade & Stacking System** designed for real-time triage of patients with severe Traumatic Brain Injury. 
+This repository contains a production-ready *Decision Cascade & Stacking System** designed for real-time triage of patients with severe Traumatic Brain Injury. 
 
 Instead of relying on a single monolithic model, the system introduces a **two-level clinical hierarchy**:
 1. **Level 1 (The Consilium):** A Domain-Specific `StackingClassifier` that processes features divided into independent clinical areas: Hemodynamic, Neurological, and Geriatric.
