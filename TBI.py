@@ -11,11 +11,6 @@ import redis
 # Funkcje do przekształcania prawdopodobieństw
 from scipy.special import logit, expit
 
-# Połączenia z infrastrukturą Docker itd.
-DB_HOST = os.getenv('DB_HOST', 'localhost')
-MONGO_HOST = os.getenv('MONGO_HOST', 'localhost')
-REDIS_HOST = os.getenv('REDIS_HOST', 'localhost')
-
 # Funkcje eksperymentalne
 from sklearn.experimental import enable_halving_search_cv, enable_iterative_imputer
 
@@ -30,10 +25,10 @@ from sklearn.svm import SVC  # SVM dla trudnych przypadków (mniejsza skuteczno�
 from sklearn.linear_model import LogisticRegression  # Prosty meta-model do fuzji wyników
 
 # Przygotowanie danych i Pipelines
-from scipy.stats import loguniform, randint #
+from scipy.stats import loguniform, randint # Podstawowe funkcje do definiowania przestrzeni poszukiwań hiperparametrów
 from sklearn.compose import ColumnTransformer  # Pozwala stosować różne transformacje do różnych kolumn
 from sklearn.impute import SimpleImputer  # Podstawowe uzupełnianie braków
-from sklearn.impute import IterativeImputer #
+from sklearn.impute import IterativeImputer  # Uzupełnianie braków na podstawie innych cech
 from sklearn.model_selection import train_test_split, cross_val_predict, StratifiedKFold  # Podział danych i walidacja krzyżowa z zachowaniem proporcji klas
 from sklearn.calibration import CalibratedClassifierCV  # Dopasowanie prawdopodobieństw modelu do rzeczywistości
 from sklearn.model_selection import HalvingRandomSearchCV # Szybszy Bayes, a mała strata jakości
@@ -46,6 +41,7 @@ from sklearn.preprocessing import FunctionTransformer  # Przekształcanie własn
 from sklearn.linear_model import BayesianRidge  # Estymator statystyczny używany przez Imputer do zgadywania wartości
 from sklearn.model_selection import train_test_split # Podział na zbiór testowy i uczący
 from sklearn.exceptions import NotFittedError # Bez błędów z ColumnDropper i MedicalNoiseAdder
+from sklearn.frozen import FrozenEstimator # Estymator zapobiegający ponownemu trenowaniu już wytrenowanego modelu
 
 # Optymalizacja i Metryki
 from skopt import BayesSearchCV  # Bayesowskie szukanie parametrów
@@ -54,10 +50,6 @@ from sklearn.calibration import calibration_curve  # Ocena kalibracji
 from sklearn.metrics import precision_recall_curve  # Optymalizacja progu (F1-score)
 from sklearn.base import BaseEstimator, TransformerMixin  # Podejmowanie bezpiecznych decyzji
 
-# Wstrzykiwanie wirtualnych danych
-from imblearn.pipeline import Pipeline as ImbPipeline
-from imblearn.over_sampling import SMOTE
-
 # Wizualizacja
 import matplotlib.pyplot as plt  # Wykresy
 import seaborn as sns  # Do macierzy pomyłek
@@ -65,6 +57,10 @@ from sklearn.metrics import confusion_matrix  # Do obliczeń macierzy
 import shap  # Biblioteka do wyjaśniania decyzji modelu
 from sklearn.metrics import accuracy_score, balanced_accuracy_score # Obliczanie metryk
 # shap.initjs() na czas testów, żeby nie ładować niepotrzebnie w głównym pipeline
+
+# Wstrzykiwanie wirtualnych danych
+from imblearn.pipeline import Pipeline as ImbPipeline
+from imblearn.over_sampling import SMOTE
 
 # Zapis modeli i obsługa wielowątkowości
 import joblib
@@ -83,6 +79,9 @@ warnings.filterwarnings("ignore", category=ConvergenceWarning)
 
 
 # Połączenia z infrastrukturą
+DB_HOST = os.getenv('DB_HOST', 'localhost')
+MONGO_HOST = os.getenv('MONGO_HOST', 'localhost')
+REDIS_HOST = os.getenv('REDIS_HOST', 'localhost')
 r_cache = redis.Redis(host=REDIS_HOST, port=6379, decode_responses=True)
 mongo_client = pymongo.MongoClient(f'mongodb://{MONGO_HOST}:27017/')
 mongo_db = mongo_client["tbi_research"]
@@ -292,12 +291,13 @@ class ColumnDropper(BaseEstimator, TransformerMixin):
 
 
 class MedicalCascadePredictor(BaseEstimator, TransformerMixin):
-    """ 3-stopniowa kaskada decyzyjna: Konsylium -> Specjalista SVM -> Sędzia
-        Rozszerzona o obsługę cech multimodalnych. """
-    def __init__(self, preprocessor, ensemble, specialist, judge):
+    """ 4-stopniowa kaskada decyzyjna: Konsylium -> Specjalista SVM -> Ekspert Geriatra -> Sędzia
+        Wzbogacona o kontekst pacjenta (Wiek, GCS, MAP) na etapie fuzji. """
+    def __init__(self, preprocessor, ensemble, specialist, geriatrist, judge):
         self.preprocessor = preprocessor
         self.ensemble = ensemble
         self.specialist = specialist
+        self.geriatrist = geriatrist  # Dodano Eksperta Geriatrycznego
         self.judge = judge
         self.feature_names_in_ = preprocessor.feature_names_in_
 
@@ -305,30 +305,35 @@ class MedicalCascadePredictor(BaseEstimator, TransformerMixin):
         if not isinstance(X_raw, pd.DataFrame):
             X_raw = pd.DataFrame(X_raw, columns=self.feature_names_in_)
 
-        # Oczyszczanie i predykcja Konsylium (dane tabelaryczne)
+        # Oczyszczanie i predykcja (dane tabelaryczne)
         X_clean = self.preprocessor.transform(X_raw)
         feature_names_out = [name.split('__')[-1] for name in self.preprocessor.get_feature_names_out()]
         X_clean_df = pd.DataFrame(X_clean, columns=feature_names_out, index=X_raw.index)
 
+        # Konsylium bazowe
         prob_main = self.ensemble.predict_proba(X_clean_df)[:, 1]
         prob_spec = prob_main.copy()
+        prob_ger = prob_main.copy()
 
-        # Wykrywanie stanu krytycznego i aktywacja Specjalisty SVM
+        # Specjalista SVM (Wykrywanie stanu krytycznego)
         is_hard_case = (X_raw['gcs_sum'] <= 8) | (prob_main >= 0.50)
-
         if is_hard_case.any():
             X_hard = X_raw[is_hard_case].copy()
             X_hard['model_1_prob'] = prob_main[is_hard_case]
             prob_spec[is_hard_case] = self.specialist.predict_proba(X_hard)[:, 1]
 
-        # Budowa macierzy meta-cech dla Sędziego
+        # Wyodrębnienie kontekstu klinicznego dla Sędziego
+        context_age = X_clean_df['age'].values if 'age' in X_clean_df.columns else np.zeros(len(X_raw))
+        context_gcs = X_clean_df['gcs_sum'].values if 'gcs_sum' in X_clean_df.columns else np.zeros(len(X_raw))
+        context_map = X_clean_df['map_min'].values if 'map_min' in X_clean_df.columns else np.zeros(len(X_raw))
+
+        # Budowa macierzy meta-cech dla Sędziego z wymaganym kontekstem i miejscem na Obrazy
         if img_prob is not None:
             if len(img_prob) != len(prob_main):
                 raise ValueError("Rozmiar img_prob musi być zgodny z liczbą pacjentów!")
-            X_meta = np.column_stack((prob_main, prob_spec, img_prob))
+            X_meta = np.column_stack((prob_main, prob_spec, prob_ger, img_prob, context_age, context_gcs, context_map))
         else:
-            # Placeholder, jeśli na tym etapie nie ma obrazu TK
-            X_meta = np.column_stack((prob_main, prob_spec, np.full_like(prob_main, 0.5)))
+            X_meta = np.column_stack((prob_main, prob_spec, prob_ger, np.full_like(prob_main, 0.5), context_age, context_gcs, context_map))
 
         final_probs = self.judge.predict_proba(X_meta)[:, 1]
         return np.column_stack((1 - final_probs, final_probs))
@@ -339,12 +344,11 @@ class MedicalCascadePredictor(BaseEstimator, TransformerMixin):
 
 
 def cascade_predict(data):
-    """ Definiujemy funkcję predykcji dla kaskady (od śmierci). """
-    # SHAP często rzuca dane jako NumPy Array, co psuje ColumnTransformer
+    """ Przyjmuje surowe/przetworzone cechy i zwraca prawdopodobieństwo końcowe kaskady. """
+    # SHAP rzuca dane jako NumPy array, przywracamy strukturę DataFrame z poprawnymi nazwami cech
     if not isinstance(data, pd.DataFrame):
-        data = pd.DataFrame(data, columns=X_train_stacking.columns)
+        data = pd.DataFrame(data, columns=X_train.columns)
 
-    # Zapewnienie, że kolumna 'model_1_prob' jest obecna, jeśli Pipeline jej wymaga
     return calibrated_spec_pipe.predict_proba(data)[:, 1]
 
 
@@ -458,6 +462,14 @@ if __name__ == "__main__":
             df['gcs_sum'] = (df['gcs_eyes'].fillna(1) +
                              df['gcs_motor'].fillna(1) +
                              df['gcs_verbal'].fillna(1))
+
+        # Izolacja komponentu ruchowego na bazie Majdan et al.
+        if 'gcs_motor' in df.columns:
+            # 1 - Brak reakcji, 2 - Wyprost, 3 - Zgięcie patologiczne
+            df['critical_motor_deficit'] = (df['gcs_motor'] <= 3).astype(int)
+
+            # Jak duży jest udział ruchu w całym wyniku? (Rozbicie iluzji sumy GCS)
+            df['motor_to_gcs_ratio'] = df['gcs_motor'] / (df['gcs_sum'] + 1e-5)
 
         # Korygowanie wartości dla osób z rurką (nie mówią)
         if 'is_intubated' in df.columns:
@@ -715,13 +727,15 @@ if __name__ == "__main__":
         voting='soft'
     )
 
-    specialist_model = SVC(
+    base_svc = SVC(
         kernel='rbf',
         probability=True,
         random_state=42,
         max_iter=10000,
         cache_size=5000
     )
+
+    specialist_model = CalibratedClassifierCV(base_svc, ensemble=False)
 
     feature_names = [name.split('__')[-1] for name in preprocessor.get_feature_names_out()]
     X_train_clean_df = pd.DataFrame(X_train_clean, columns=feature_names)
@@ -765,184 +779,188 @@ if __name__ == "__main__":
 
     # Optymalizacja Bayesowska silników modeli
     print("Rozpoczynam naukę Bayesowską XGB+LGBM+RF przez Turniej Halving.")
+    consilium_path = 'models/XGB_LGBM_RF.pkl'
 
-    # Przygotowujemy scorer. Beta=1.5 oznacza, że Recall jest ważniejszy od Precision.
-    SAFE_SCORER = make_scorer(fbeta_score, beta=1.5)
+    if os.path.exists(consilium_path):
+        print(f"[CACHE] Znaleziono zapisany model Konsylium. Pomijam turniej i ładuję: {consilium_path}")
+        ensemble_best = joblib.load(consilium_path)
+    else:
 
-    # Skracamy search_space do samych silników, dostosowując nazewnictwo
-    consilium_search_space = {
-        'lgbm__n_estimators': randint(500, 2000),
-        'lgbm__learning_rate': loguniform(0.005, 0.2),
-        'lgbm__num_leaves': randint(20, 60),
-        'lgbm__scale_pos_weight': loguniform(1.0, 8.0),
+        # Przygotowujemy scorer. Beta=1.5 oznacza, że Recall jest ważniejszy od Precision.
+        SAFE_SCORER = make_scorer(fbeta_score, beta=1.5)
 
-        'xgb__n_estimators': randint(500, 2000),
-        'xgb__learning_rate': loguniform(0.005, 0.2),
-        'xgb__max_depth': randint(3, 7),
-        'xgb__min_child_weight': randint(1, 5),
-        'xgb__scale_pos_weight': loguniform(1.0, 8.0),
+        # Skracamy search_space do samych silników, dostosowując nazewnictwo
+        consilium_search_space = {
+            # LightGBM - zawężamy wokół sprawdzonych wartości
+            'lgbm__n_estimators': randint(900, 1500),  # wokół 1185
+            'lgbm__learning_rate': loguniform(0.001, 0.015),  # przesunięte w dół (bliżej podłogi)
+            'lgbm__num_leaves': randint(40, 65),  # wokół 50
+            'lgbm__scale_pos_weight': loguniform(4.0, 9.0),  # wokół 6.8
 
-        'rf__n_estimators': randint(100, 500),
-        'rf__max_depth': randint(5, 15)
-    }
+            # XGBoost - stabilizujemy wokół optimum
+            'xgb__n_estimators': randint(900, 1500),  # wokół 1117
+            'xgb__learning_rate': loguniform(0.001, 0.015),  # przesunięte w dół
+            'xgb__max_depth': randint(5, 8),  # wokół 6
+            'xgb__min_child_weight': randint(3, 6),  # wokół 4
+            'xgb__scale_pos_weight': loguniform(1.2, 2.5),  # wokół 1.8
 
-    # Konsylium (wszyscy widzą całe X_train_clean_df)
-    final_consilium = VotingClassifier(
-        estimators=[
-            ('lgbm', lgbm_model),
-            ('rf', RandomForestClassifier(n_jobs=-1, random_state=42)),
-            ('xgb', xgb_model)
-        ],
-        voting='soft'
-    )
+            # RandomForest - zwrot w stronę mniejszych zasobów
+            'rf__n_estimators': randint(100, 250),  # wokół 135
+            'rf__max_depth': randint(10, 15)  # wokół 13
+        }
 
-    # Wstrzyknięcie pełnej, 57-elementowej krotki ograniczeń monotonicznych
-    final_consilium.named_estimators['lgbm'].set_params(monotone_constraints=monotone_tuple)
-    final_consilium.named_estimators['xgb'].set_params(monotone_constraints=monotone_tuple)
+        # Konsylium (wszyscy widzą całe X_train_clean_df)
+        geriatrist_model = xgb.XGBClassifier(
+            n_estimators=750,
+            max_depth=4,
+            learning_rate=0.01,
+            random_state=42,
+            n_jobs=-1
+        )
 
-    # Uruchomienie turnieju dla Etapu 1
-    opt = HalvingRandomSearchCV(
-        estimator=final_consilium,
-        param_distributions=consilium_search_space,
-        n_candidates=500,
-        factor=3,
-        resource='n_samples',
-        min_resources=5000,
-        cv=StratifiedKFold(n_splits=3, shuffle=True, random_state=42),
-        n_jobs=-1,
-        scoring='roc_auc',
-        random_state=42,
-        verbose=1
-    )
+        final_consilium = VotingClassifier(
+            estimators=[
+                ('lgbm', lgbm_model),
+                ('rf', RandomForestClassifier(n_jobs=-1, random_state=42)),
+                ('xgb', xgb_model)
+            ],
+            voting='soft'
+        )
 
-    with parallel_backend('threading'):
-        opt.fit(X_train_clean_df, y_train)
+        # Wstrzyknięcie pełnej, 57-elementowej krotki ograniczeń monotonicznych
+        final_consilium.named_estimators['lgbm'].set_params(monotone_constraints=monotone_tuple)
+        final_consilium.named_estimators['xgb'].set_params(monotone_constraints=monotone_tuple)
 
-    print(f"Najlepsze parametry Konsylium znalezione: {opt.best_params_}")
-    joblib.dump(opt.best_estimator_, 'models/XGB_LGBM_RF.pkl')
-    ensemble_best = opt.best_estimator_
+        # Uruchomienie turnieju dla Etapu 1
+        opt = HalvingRandomSearchCV(
+            estimator=final_consilium,
+            param_distributions=consilium_search_space,
+            n_candidates=500,
+            factor=3,
+            resource='n_samples',
+            min_resources=5000,
+            cv=StratifiedKFold(n_splits=3, shuffle=True, random_state=42),
+            n_jobs=-1,
+            scoring='roc_auc',
+            random_state=42,
+            verbose=1
+        )
 
-    # Predykcje końcowe dla zbioru testowego
-    y_pred_main = pd.Series(opt.predict(X_test_clean_df), index=X_test.index)
-    y_prob_main = opt.predict_proba(X_test_clean_df)[:, 1]
+        with parallel_backend('threading'):
+            opt.fit(X_train_clean_df, y_train)
 
-    print(f"Ostateczny wynik Konsylium po optymalizacji AUC: {roc_auc_score(y_test, y_prob_main):.4f}")
+        print(f"Najlepsze parametry Konsylium znalezione: {opt.best_params_}")
+        joblib.dump(opt.best_estimator_, 'models/XGB_LGBM_RF.pkl')
+        ensemble_best = opt.best_estimator_
+
+        # Predykcje końcowe dla zbioru testowego
+        y_pred_main = pd.Series(opt.predict(X_test_clean_df), index=X_test.index)
+        y_prob_main = opt.predict_proba(X_test_clean_df)[:, 1]
+
+        print(f"Ostateczny wynik Konsylium po optymalizacji AUC: {roc_auc_score(y_test, y_prob_main):.4f}")
 
     # Wyznaczamy pacjentów w stanie krytycznym i filtrujemy zbiór dla Specjalisty
-    train_probs_main = opt.predict_proba(X_train_clean_df)[:, 1]
+    train_probs_main = ensemble_best.predict_proba(X_train_clean_df)[:, 1]
 
     # Definiujemy stan krytyczny (Konsylium daje ryzyko zgonu >= 50% lub twardy stan kliniczny GCS <= 8)
     critical_mask = (X_train['gcs_sum'] <= 8) | (train_probs_main >= 0.50)
 
     print(f"Liczba pacjentów przekazanych do Specjalisty: {np.sum(critical_mask)} z {len(X_train)}")
 
-    # Tworzymy zbiór treningowy WYŁĄCZNIE dla tych trudnych przypadków
-    X_train_for_spec = X_train[critical_mask].copy()
-    y_train_spec = y_train[critical_mask]
+    SVM_PATH = 'models/SVM.pkl'
+    if os.path.exists(SVM_PATH):
+        print(f"[CACHE] Znaleziono zapisany model Specjalisty SVM. Pomijam turniej i ładuję: {SVM_PATH}")
+        calibrated_spec = joblib.load(SVM_PATH)
+    else:
+        # Tworzymy zbiór treningowy tylko dla tych trudnych przypadków
+        X_train_for_spec = X_train[critical_mask].copy()
+        y_train_spec = y_train[critical_mask]
 
-    # Dodajemy pewność modelu głównego jako nową cechę
-    X_train_for_spec['model_1_prob'] = train_probs_main[critical_mask]
+        # Dodajemy pewność modelu głównego jako nową cechę
+        X_train_for_spec['model_1_prob'] = train_probs_main[critical_mask]
 
-    # Preprocesor i standardowy Pipeline (SVM ma wbudowane class_weight='balanced')
-    spec_prep = ColumnTransformer([
-        ('num', Pipeline([('imp', SimpleImputer(strategy='constant', fill_value=-1)), ('sc', RobustScaler())]),
-         X_train_for_spec.select_dtypes(include='number').columns),
-        ('cat',
-         Pipeline([('imp', SimpleImputer(strategy='most_frequent')), ('oh', OneHotEncoder(handle_unknown='ignore'))]),
-         X_train_for_spec.select_dtypes(include='object').columns)
-    ])
+        # Preprocesor i standardowy Pipeline (SVM ma wbudowane class_weight='balanced')
+        spec_prep = ColumnTransformer([
+            ('num', Pipeline([
+                ('imp', SimpleImputer(strategy='constant', fill_value=-1)),
+                ('sc', RobustScaler()),
+                ('noise', AdaptiveMedicalNoiseAdder())
+            ]), X_train_for_spec.select_dtypes(include='number').columns),
+            ('cat', Pipeline([
+                ('imp', SimpleImputer(strategy='most_frequent')),
+                ('oh', OneHotEncoder(handle_unknown='ignore'))
+            ]), X_train_for_spec.select_dtypes(include='object').columns)
+        ])
 
-    specialist_model = SVC(
-        kernel='rbf',
-        probability=True,
-        random_state=42,
-        max_iter=10000,
-        cache_size=5000,
-        class_weight='balanced'
-    )
+        specialist_model = SVC(
+            kernel='rbf',
+            probability=True,
+            random_state=42,
+            max_iter=10000,
+            cache_size=5000,
+            class_weight='balanced'
+        )
 
-    spec_pipe = Pipeline([('prep', spec_prep), ('svm', specialist_model)])
+        spec_pipe = Pipeline([
+            ('prep', spec_prep),
+            ('svm', specialist_model)
+        ])
 
-    print("Rozpoczynam naukę Specjalisty SVM na podzbiorze krytycznym.")
+        print("Rozpoczynam naukę Specjalisty SVM na podzbiorze krytycznym.")
 
-    # Optymalizacja Bayesowska dla SVM
-    svm_search_space = {
-        'svm__C': loguniform(0.1, 10),
-        'svm__gamma': loguniform(0.0001, 1)
-    }
+        # Filtrowanie pacjentów trudnych
+        uncertain_mask_spec = (X_train_for_spec['model_1_prob'] > 0.25) & (X_train_for_spec['model_1_prob'] < 0.75)
+        X_uncertain = X_train_for_spec[uncertain_mask_spec]
+        y_uncertain = y_train_spec[uncertain_mask_spec]
 
-    # Bierzemy 15% zbioru krytycznego, ale nie mniej niż 500 próbek na start turnieju
-    dynamic_min_resources = max(500, int(np.sum(critical_mask) * 0.15))
+        # Bierzemy wszystkich pacjentów krytycznych 3 razy, a tych najbardziej niepewnych dorzucamy jeszcze 2 razy.
+        X_train_augmented = pd.concat([X_train_for_spec] * 3 + [X_uncertain] * 2, ignore_index=True)
+        y_train_augmented = pd.concat([y_train_spec] * 3 + [y_uncertain] * 2, ignore_index=True)
+        print(f"Rozmiar zbioru po fizycznym balansowaniu szarej strefy: {len(X_train_augmented)}")
 
-    opt_spec = HalvingRandomSearchCV(
-        spec_pipe,
-        svm_search_space,
-        n_candidates=50,
-        factor=2,
-        resource='n_samples',
-        min_resources=dynamic_min_resources,
-        cv=StratifiedKFold(n_splits=3, shuffle=True, random_state=42),
-        scoring='roc_auc',
-        n_jobs=-1,
-        random_state=42,
-        verbose=1
-    )
+        # Przestrzeń hiperparametrów do nauki SVM
+        svm_search_space = {
+            'svm__C': loguniform(0.01, 100.0),
+            'svm__gamma': loguniform(0.00001, 10.0),
+            'svm__kernel': ['rbf', 'poly', 'sigmoid'],
+            'svm__degree': randint(2, 5),
+            'svm__class_weight': ['balanced', {0: 1, 1: 2}, {0: 1, 1: 5}]
+        }
 
-    with parallel_backend('threading'):
-        # Trenujemy zbiór ograniczony, bez wstrzykiwania sztucznych wag
-        opt_spec.fit(X_train_for_spec, y_train_spec)
+        # Obliczanie bezpiecznych zasobów startowych dla turnieju Halving
+        dynamic_min_resources = max(500, int(np.sum(critical_mask) * 0.15))
 
-    # Kalibracja Specjalisty na tym samym podzbiorze
-    calibrated_spec = CalibratedClassifierCV(
-        opt_spec.best_estimator_,
-        method='isotonic',
-        cv='prefit'
-    )
-    calibrated_spec.fit(X_train_for_spec, y_train_spec)
+        # Turniej Halving, żeby wybrać jak najlepsze parametry
+        opt_spec = HalvingRandomSearchCV(
+            spec_pipe,
+            svm_search_space,
+            n_candidates=300,
+            factor=2,
+            resource='n_samples',
+            min_resources=dynamic_min_resources,
+            cv=StratifiedKFold(n_splits=5, shuffle=True, random_state=42),
+            scoring='roc_auc',
+            n_jobs=-1,
+            random_state=42,
+            verbose=1
+        )
 
-    print("Zapisywanie Specjalisty (SVM).")
-    joblib.dump(calibrated_spec, 'models/SVM.pkl')
+        with parallel_backend('threading'):
+            # Czysty FIT bez parametru 'sample_weight' - model sam się dostosuje dzięki fizycznym klonom
+            opt_spec.fit(X_train_augmented, y_train_augmented)
 
-    print(f"Rozpoczynam naukę Specjalisty SVM na CAŁYM zbiorze ({len(X_train_for_spec)} pacjentów) z korektą wagową.")
+        print("Rozpoczynam automatyczną kalibrację prawdopodobieństw Specjalisty (CV=5).")
+        calibrated_spec = CalibratedClassifierCV(
+            estimator=opt_spec.best_estimator_,
+            method='isotonic',
+            cv=5
+        )
 
-    # Dynamiczne wyliczenie wag dopasowanych wyłącznie do rozmiaru X_train_for_spec
-    uncertain_mask_spec = (X_train_for_spec['model_1_prob'] > 0.25) & (X_train_for_spec['model_1_prob'] < 0.75)
-    sample_weights_spec = np.ones(len(X_train_for_spec))
-    sample_weights_spec[uncertain_mask_spec] = 1.5
+        # Czysta kalibracja na zbalansowanym fizycznie zbiorze
+        calibrated_spec.fit(X_train_augmented, y_train_augmented)
 
-    # Pobranie twardego targetu dopasowanego wyłącznie do indeksów zbioru spec
-    y_train_spec = y_train.loc[X_train_for_spec.index]
-
-    opt_spec = HalvingRandomSearchCV(
-        spec_pipe,
-        svm_search_space,
-        n_candidates=50,
-        factor=2,
-        resource='n_samples',
-        # Dynamiczne min_resources chroniące przed crashem przy małej liczbie pacjentów krytycznych
-        min_resources=min(2000, len(X_train_for_spec)),
-        cv=StratifiedKFold(n_splits=3, shuffle=True, random_state=42),
-        scoring='roc_auc',
-        n_jobs=-1,
-        random_state=42,
-        verbose=1
-    )
-
-    with parallel_backend('threading'):
-        # Przekazanie zsynchronizowanych wymiarowo wektorów y_train_spec oraz sample_weights_spec
-        opt_spec.fit(X_train_for_spec, y_train_spec, svm__sample_weight=sample_weights_spec)
-
-    # Kalibracja Specjalisty (cv='prefit' zabezpiecza system przed zapomnieniem wag)
-    calibrated_spec = CalibratedClassifierCV(
-        opt_spec.best_estimator_,
-        method='isotonic',
-        cv='prefit'
-    )
-    # Dopasowanie wektora targetu do kalibracji
-    calibrated_spec.fit(X_train_for_spec, y_train_spec)
-
-    print("Zapisywanie Specjalisty (SVM).")
-    joblib.dump(calibrated_spec, 'models/SVM.pkl')
+        print("Zapisywanie Specjalisty (SVM).")
+        joblib.dump(calibrated_spec, SVM_PATH)
 
     print("Przygotowanie modeli do ostatecznej fuzji.")
     try:
@@ -956,60 +974,76 @@ if __name__ == "__main__":
 
     print("Synchronizacja ograniczeń medycznych dla XGBoosta (Ekspert Geriatryczny).")
 
-    for est_list in [ensemble_best.estimators_, ensemble_best.estimators]:
-        for item in est_list:
-            name = item[0] if isinstance(item, tuple) else ""
-            obj = item[1] if isinstance(item, tuple) else item
-            if isinstance(obj, Pipeline) and name == 'geriatrist':
-                inner_model = obj.named_steps['model']
-                if 'XGB' in str(type(inner_model)):
-                    inner_model.set_params(monotone_constraints=tuple(geriatric_constraints_list))
+    # Zabezpieczenie: jeśli zmienna nie istnieje w pamięci, przypisz jej listę
+    if 'geriatric_constraints_list' not in locals() and 'geriatric_constraints_list' not in globals():
+        geriatric_constraints_list = []
+        for col in X_train_clean_df.columns:
+            col_lower = col.lower()
+            if any(x in col_lower for x in
+                   ['gcs', 'sysbp', 'spo2', 'map_min', 'neurological_efficiency', 'adjusted_gcs', 'mobility_score',
+                    'bmi_score']):
+                geriatric_constraints_list.append(-1)
+            elif any(x in col_lower for x in
+                     ['age', 'charlson', 'cci', 'comorbidity', 'frailty', 'shock_index', 'is_hypotensive',
+                      'polypharmacy']):
+                geriatric_constraints_list.append(1)
+            else:
+                geriatric_constraints_list.append(0)
 
-    print(f"Pomyślnie zresetowano ograniczenia ({len(geriatric_constraints_list)}) dla Eksperta Geriatrycznego.")
+        geriatrist_model = xgb.XGBClassifier(
+            n_estimators=750, max_depth=4, learning_rate=0.01,
+            monotone_constraints=tuple(geriatric_constraints_list),
+            scale_pos_weight=3.0, random_state=42, verbosity=0, n_jobs=-1
+        )
+        geriatrist_model.fit(X_train_clean_df, y_train)
 
-    X_train_stacking = X_train_clean_df.copy()
-    X_test_final = X_test_clean_df.copy()
+        print("Generowanie predykcji OOF dla Sędziego.")
 
-    print("Generowanie predykcji OOF dla Sędziego.")
+        # Wyciągnięcie przewidywań z trzech niezależnych źródeł
+        y_prob_train_main_oof = \
+        cross_val_predict(ensemble_best, X_train_clean_df, y_train, cv=3, method='predict_proba', n_jobs=-1)[:, 1]
+        y_prob_train_ger_oof = \
+        cross_val_predict(geriatrist_model, X_train_clean_df, y_train, cv=3, method='predict_proba', n_jobs=-1)[:, 1]
 
-    y_prob_train_main_oof = cross_val_predict(
-        ensemble_best, X_train_clean_df, y_train,
-        cv=3, method='predict_proba', n_jobs=-1
-    )[:, 1]
+        y_prob_train_spec_oof = y_prob_train_main_oof.copy()
+        hard_mask_oof = (X_train['gcs_sum'] <= 8) | ((y_prob_train_main_oof > 0.15) & (y_prob_train_main_oof < 0.85))
 
-    # Odtwarzamy szarą strefę za pomocą w pełni uczciwych prognoz Głównego
-    hard_mask_oof = (X_train['gcs_sum'] <= 8) | ((y_prob_train_main_oof > 0.15) & (y_prob_train_main_oof < 0.85))
+        if hard_mask_oof.sum() > 0:
+            X_spec_train_oof = X_train[hard_mask_oof].copy()
+            X_spec_train_oof['model_1_prob'] = y_prob_train_main_oof[hard_mask_oof]
+            y_prob_train_spec_oof[hard_mask_oof] = \
+            cross_val_predict(opt_spec.best_estimator_, X_spec_train_oof, y_train[hard_mask_oof], cv=3,
+                              method='predict_proba', n_jobs=-1)[:, 1]
 
-    # Inicjujemy predykcję Sędziego odkopując pewność z Konsylium dla łatwych diagnoz
-    y_prob_train_spec_oof = y_prob_train_main_oof.copy()
+        # Zbieranie kontekstu medycznego pacjenta dla sędziego
+        ctx_age = X_train_clean_df['age'].values if 'age' in X_train_clean_df.columns else np.zeros(len(X_train))
+        ctx_gcs = X_train_clean_df['gcs_sum'].values if 'gcs_sum' in X_train_clean_df.columns else np.zeros(
+            len(X_train))
+        ctx_map = X_train_clean_df['map_min'].values if 'map_min' in X_train_clean_df.columns else np.zeros(
+            len(X_train))
 
-    if hard_mask_oof.sum() > 0:
-        print(f"Wyliczanie OOF SVM tylko dla {hard_mask_oof.sum()} pacjentów w szarej strefie.")
-        X_spec_train_oof = X_train[hard_mask_oof].copy()
-        X_spec_train_oof['model_1_prob'] = y_prob_train_main_oof[hard_mask_oof]
-        y_spec_train_oof = y_train[hard_mask_oof]
+        # Pusta przestrzeń dla przyszłego Transformera Obrazowego
+        ctx_img_placeholder = np.full_like(y_prob_train_main_oof, 0.5)
 
-        y_prob_spec_hard_oof = cross_val_predict(
-            opt_spec.best_estimator_, X_spec_train_oof, y_spec_train_oof,
-            cv=3, method='predict_proba', n_jobs=-1
-        )[:, 1]
+        # Nauka Sędziego na spójnej, 7-kolumnowej matrycy OOF
+        X_meta_train = np.column_stack((
+            y_prob_train_main_oof, y_prob_train_spec_oof, y_prob_train_ger_oof,
+            ctx_img_placeholder, ctx_age, ctx_gcs, ctx_map
+        ))
+        final_judge = LogisticRegression(solver='lbfgs', C=0.01, max_iter=2500, class_weight='balanced',
+                                         random_state=42)
+        final_judge.fit(X_meta_train, y_train)
 
-        # Podmieniamy wyniki tylko tam, gdzie zażądaliśmy interwencji specjalisty
-        y_prob_train_spec_oof[hard_mask_oof] = y_prob_spec_hard_oof
+        print("Rozpoczynam ostateczne scalanie systemów (Context-Aware Blending).")
 
-    # Trening Sędziego (Meta-Model)
-    X_meta_train = np.column_stack((y_prob_train_main_oof, y_prob_train_spec_oof))
-    final_judge = LogisticRegression(solver='lbfgs', C=0.01, max_iter=1000, class_weight='balanced', random_state=42)
-    final_judge.fit(X_meta_train, y_train)
-
-    # Na koniec budowa kaskady
-    print("Rozpoczynam ostateczne scalanie systemów (Custom Blending).")
-    calibrated_spec_pipe = MedicalCascadePredictor(
-        preprocessor=preprocessor,
-        ensemble=ensemble_best,
-        specialist=calibrated_spec,
-        judge=final_judge
-    )
+        # Inicjalizacja pełnej kaskady
+        calibrated_spec_pipe = MedicalCascadePredictor(
+            preprocessor=preprocessor,
+            ensemble=ensemble_best,
+            specialist=calibrated_spec,
+            geriatrist=geriatrist_model,
+            judge=final_judge
+        )
 
     # Ewaluacja
     y_final_prob = calibrated_spec_pipe.predict_proba(X_test)[:, 1]
@@ -1055,40 +1089,39 @@ if __name__ == "__main__":
 
     if hasattr(xgb_model, "get_booster"):
         booster = xgb_model.get_booster()
-        booster.set_attr(base_score="0.5")
+        # Wymuszamy nadpisanie base_score na czysty string reprezentujący float bez nawiasów
+        try:
+            import json
+
+            config = json.loads(booster.save_config())
+            # Wyciągamy rzeczywisty base_score z konfiguracji XGBoosta, czyszcząc nawiasy jeśli istnieją
+            raw_score = config["learner"]["learner_model_param"]["base_score"]
+            clean_score = raw_score.replace('[', '').replace(']', '')
+            booster.set_attr(base_score=str(float(clean_score)))
+        except Exception:
+            # Rezerwowy fallback, jeśli struktura configu w danej wersji xgb się różni
+            booster.set_attr(base_score="0.5")
 
     # Wyjaśnienie modelu przez SHAP dla samego XGBoosta
-    explainer = shap.TreeExplainer(xgb_model)
-    shap_values = explainer.shap_values(X_test_clean_df)
-
-    # Przygotowanie danych do SHAP Kaskady i wykresu ekspertów
-    X_test_for_spec = X_test.copy()
-    X_test_for_spec['model_1_prob'] = ensemble_best.predict_proba(X_test_clean_df)[:, 1]
-    y_prob_spec_full = calibrated_spec.predict_proba(X_test_for_spec)[:, 1]
-
-    print("Generuję analizę SHAP dla systemu kaskadowego.")
+    print("Generuję wykres SHAP dla silnika XGBoost.")
     try:
-        # Tło dla KernelExplainera pobieramy ze zbioru treningowego z dodaną kolumną
-        X_train_for_shap = X_train.copy()
-        X_train_for_shap['model_1_prob'] = ensemble_best.predict_proba(X_train_clean_df)[:, 1]
+        explainer = shap.TreeExplainer(xgb_model)
+        shap_values = explainer.shap_values(X_test_clean_df)
 
-        background_data = shap.sample(X_train_for_shap, 50)
-        explainer_cascade = shap.KernelExplainer(cascade_predict, background_data)
-        test_sample = X_test_for_spec.sample(min(5, len(X_test_for_spec)), random_state=42)
-        shap_values_cascade = explainer_cascade.shap_values(test_sample)
-
-        plt.figure(figsize=(12, 8))
-        shap.summary_plot(shap_values_cascade, test_sample, show=False)
-        plt.title("Wpływ cech na ostateczną decyzję Kaskady")
-        plt.savefig('models/shap_cascade_global.png')
+        plt.figure(figsize=(10, 6))
+        shap.summary_plot(shap_values, X_test_clean_df, show=False)
+        plt.title("Istotność cech w silniku XGBoost (Konsylium)")
+        plt.tight_layout()
+        plt.savefig('models/shap_xgb_global.png')
         plt.close()
+        print("Wykres SHAP dla XGBoost wygenerowany pomyślnie.")
     except Exception as e:
-        print(f"Krytyczny błąd SHAP: {e}")
+        print(f"Błąd SHAP dla XGBoost: {e}")
 
     # Raportowanie i orkiestra
     tn, fp, fn, tp = cm.ravel()
-    print(f"\nTN: {tn:>5} | FP: {fp:>5} | FN: {fn:>5} | TP: {tp:>5}")
-    print(f"Czułość (Recall): {(tp / (tp + fn)) * 100:.2f}% | Swoistość (Spec): {(tn / (tn + fp)) * 100:.2f}%\n")
+    print(f"TN: {tn:>5} | FP: {fp:>5} | FN: {fn:>5} | TP: {tp:>5}")
+    print(f"Czułość: {(tp / (tp + fn)) * 100:.2f}% | Swoistość (Spec): {(tn / (tn + fp)) * 100:.2f}%\n")
 
     current_patient_id = 1
     current_prob = float(y_final_prob[0])
@@ -1135,17 +1168,17 @@ sns.heatmap(gcs_cm, annot=True, fmt='d', cmap='Reds',
             yticklabels=['Przeżycie', 'Zgon'])
 
 plt.title('Macierz Pomyłek: Tylko Reguła GCS <= 5 dla sprawdzenia jakości')
-plt.ylabel('Prawda (Ground Truth)')
-plt.xlabel('Predykcja (Reguła GCS)')
+plt.ylabel('Prawda')
+plt.xlabel('Predykcja')
 plt.savefig('models/confusion_matrix_GCS_baseline.png')
 plt.show()
 
 # Bezpośrednie porównanie z modelem
 model_bal_acc = balanced_accuracy_score(y_test, (y_final_prob >= best_threshold).astype(int))
-print(f"Zysk z użycia Kaskady ML: {((model_bal_acc - gcs_bal_acc) * 100):.2f}% (Balanced Accuracy)")
+print(f"Zysk z użycia Kaskady ML: {((model_bal_acc - gcs_bal_acc) * 100):.2f}%")
 
 # Przestawić moje HCR na analizę skanów mózgu: najpierw RSNA, potem do złączenia CQ-500
 r""" cd C:\TBI\database_model
      docker-compose up -d
-     docker exec -it hospital_postgres psql -U postgres -d hospital_db -c "SELECT count(*) FROM Patients;" 
-     python TBI.py """
+     docker exec -it tbi_postgres psql -U postgres -d hospital_db -c "SELECT count(*) FROM Patients;"
+     ..\.venv\Scripts\python.exe TBI.py """
