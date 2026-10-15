@@ -48,7 +48,7 @@ Instead of relying solely on tabular data, the system directly processes raw CT 
 - **DenseNet 3D + ViT (Calvarial & Skull Base Fractures):** A network operating on the bone window combined with a Vision Transformer to instantly detect advanced calvarial and skull base fractures by capturing global spatial context across volumetric slices.
 *Clinical Impact:* Beyond compromising structural skull integrity, basal fractures frequently tear the dura mater or impinge on cranial nerves and major cerebral vessels, risking catastrophic cerebrospinal fluid leaks, intracranial infections, and permanent sensory motor losses.
 
-- **UNet + EfficientNet (Corpus Callosum & Diffuse Axonal Injury):** Corpus callosum extraction masking background noise, fed into an optimized EfficientNet backbone that extracts robust spatial features to detect microscopic diffuse axonal injuries invisible to standard CNNs.<br>
+- **UNet -> EfficientNet (Corpus Callosum & Diffuse Axonal Injury):** Corpus callosum extraction masking background noise, fed into an optimized EfficientNet backbone that extracts robust spatial features to detect microscopic diffuse axonal injuries invisible to standard CNNs.<br>
   *Clinical Impact:* As the massive white matter highway connecting both cerebral hemispheres, the corpus callosum is acutely vulnerable to mechanical shearing forces. Damage here permanently decouples interhemispheric communication, resulting in severe executive dysfunction and long term vegetative states representing some of the most stubborn and heartbreaking barriers in neurological rehabilitation.
 
 ### Holistic Judge & Dynamic Trajectory
