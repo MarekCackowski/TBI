@@ -44,12 +44,12 @@ Instead of relying solely on tabular data, the system directly processes raw CT 
 - **CRNN (Hemorrhage & Volumetric Mass Effect Cascades):** Sequential analysis of brain slices enhanced by a *Slice Attention* mechanism for multilabel classification of hemorrhages and tracking the 3D spatial dynamics of mass lesions and tumors.
   *Clinical Impact:* Lesions and blood collections act as expanding masses that rapidly escalate intracranial pressure and induce secondary ischemia. By decomposing volumetric analysis into 2D feature extraction coupled with recurrent Zaxis tracking, the CRNN bypasses 3D CNN bottlenecks while accurately mapping the three dimensional morphology and spatial expansion patterns of complex pathologies.
 
+- **DenseNet 3D + ViT (Calvarial & Skull Base Fractures):** A network operating on the bone window combined with a Vision Transformer to instantly detect advanced calvarial and skull base fractures by capturing global spatial context across volumetric slices.
+*Clinical Impact:* Beyond compromising structural skull integrity, basal fractures frequently tear the dura mater or impinge on cranial nerves and major cerebral vessels, risking catastrophic cerebrospinal fluid leaks, intracranial infections, and permanent sensory motor losses.
+
 - **UNet + EfficientNet (Corpus Callosum & Diffuse Axonal Injury):** Corpus callosum extraction masking background noise, fed into an optimized EfficientNet backbone that extracts robust spatial features to detect microscopic diffuse axonal injuries invisible to standard CNNs.
   
 *Clinical Impact:* As the massive white matter highway connecting both cerebral hemispheres, the corpus callosum is acutely vulnerable to mechanical shearing forces. Damage here permanently decouples interhemispheric communication, resulting in severe executive dysfunction and long term vegetative states representing some of the most stubborn and heartbreaking barriers in neurological rehabilitation.
-
-- **DenseNet 3D + ViT (Calvarial & Skull Base Fractures):** A network operating on the bone window combined with a Vision Transformer to instantly detect advanced calvarial and skull base fractures by capturing global spatial context across volumetric slices.
-*Clinical Impact:* Beyond compromising structural skull integrity, basal fractures frequently tear the dura mater or impinge on cranial nerves and major cerebral vessels, risking catastrophic cerebrospinal fluid leaks, intracranial infections, and permanent sensory motor losses.
 
 ### Holistic Judge & Dynamic Trajectory
 Combining logits from all modalities into a final life saving decision:
