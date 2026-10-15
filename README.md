@@ -3,7 +3,7 @@
 
 > "Professor Jan Talar proved that there are no hopeless patients. Only those who were robbed of time and hope too early. Awakening from a coma is a slow process, not a single event. Assessing prognosis in this early phase is a trap, because we are examining an individual whose brain is in deep shock, operating in emergency mode, and has not yet fully recovered its function. Denying a person a chance based on a five point questionnaire is the ultimate capitulation to the complexity of the brain."
 
-When Bryan Jennett and Graham Teasdale created the **Glasgow Coma Scale** in 1974, their goal was to standardize rapid communication between nurses and doctors. The creators themselves were horrified when, decades later, hospitals began using this 5-item, superficial questionnaire as the ultimate oracle for deciding whether to withdraw life support or deny treatment. 
+When Bryan Jennett and Graham Teasdale created the **Glasgow Coma Scale** in 1974, their goal was to standardize rapid communication between nurses and doctors. The creators themselves were horrified when, decades later, hospitals began using this 5 item, superficial questionnaire as the ultimate oracle for deciding whether to withdraw life support or deny treatment. 
 
 GCS is blind to what happens inside the skull. This project is physical proof of how to fix that flaw. The system does not evaluate a patient based on a few external reflexes; it reads raw tomographic scans and tabular data, tracks continuous ICU telemetry, and untangles the deceptive webs of modern intensive care pharmacotherapy.
 
@@ -18,19 +18,19 @@ The system was designed for a high risk environment where minimizing missed crit
 Processing structured data from life support equipment and medical history through a multi-stage defense line designed to overcome the rigidity of standard algorithms:
 
 * **Data Quality Guardrails:** Automated ETL validation suite enforcing strict schema types, uniqueness checks, and physiological range assertions before data enters the persistence layer.
-* **Tabular Cascade & Auto-Noising (`RLAutoNoiseAgent`):** A reinforcement learning agent that dynamically injects structured noise during training. This forces the model to ignore subjective human scoring errors (such as inconsistent nursing entries for GCS or APACHE) and learn true underlying physiological fragility.
+* **Tabular Cascade & Auto Noising (`RLAutoNoiseAgent`):** A reinforcement learning agent that dynamically injects structured noise during training. This forces the model to ignore subjective human scoring errors (such as inconsistent nursing entries for GCS or APACHE) and learn true underlying physiological fragility.
 
 #### Phase 1: Asymmetric Tree Ensemble (Broad Screening)
 Rejecting bagging in favor of gradient boosting algorithms that aggressively minimize residuals on critical cases. This phase combines distinct algorithms tailored for their complementary strengths:
 * **XGBoost:** Provides precise residual regularization to prevent overfitting on noisy medical telemetry.
-* **LightGBM:** Utilizes leaf-wise growth optimized to capture non-linear interactions across high-dimensional features.
+* **LightGBM:** Utilizes leaf wise growth optimized to capture non-linear interactions across high-dimensional features.
 * **CatBoost:** Employs symmetrically built trees to completely prevent feature overfitting on severe minority mortality classes.
 * **TabNet:** Applies sequential attention mechanisms over tabular features to mimic human feature selection and reasoning.
 
 #### Phase 2: GMM Phenotype Router & Isolation Forest (Borderline Stratification)
 Standard decision trees split feature space along strict right angles, which catastrophically fails for complex, borderline ICU patients whose multi-system failures cannot be boxed into axis-aligned rules. To solve this:
-* **Isolation Forest:** First isolates out-of-distribution anomalies.
-* **Gaussian Mixture Model (GMM):** Performs soft clustering to map patients into distinct physiological phenotypes based on multidimensional distance.
+* **Isolation Forest:** First isolates out of distribution anomalies.
+* **Gaussian Mixture Model:** Performs soft clustering to map patients into distinct physiological phenotypes based on multidimensional distance.
 
 ### Specialist Model Routing (Targeted Decision Making)
 Rather than forcing a single architecture to handle everything, ambiguous and high risk cases identified by the router are dynamically delegated to specialized mathematical paradigms:
