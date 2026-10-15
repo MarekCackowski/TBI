@@ -33,10 +33,11 @@ Standard decision trees split feature space along strict right angles, which cat
 * **Gaussian Mixture Model:** Performs soft clustering to map patients into distinct physiological phenotypes based on multidimensional distance.
 
 ### Specialist Model Routing (Targeted Decision Making)
-Rather than forcing a single architecture to handle everything, ambiguous and high risk cases identified by the router are dynamically delegated to specialized mathematical paradigms:
--   **Non Linear SVM:** Projects complex borderline cases into higher dimensional spaces to find smooth, robust geometric separation boundaries where tree margins break down.
--   **LogReg + KNN:** Evaluates the physiological distance to historical survivors and non survivors using nearest neighbor metrics combined with calibrated linear risk weights.
--   **Non Linear MLP:** Models dense, continuous interactions of metabolic collapse for patients in profound neurogenic shock whose trajectories defy discrete rule based logic.
+Rather than forcing a single architecture to handle everything, ambiguous and high-risk cases identified by the router are dynamically delegated to specialized mathematical paradigms:
+- **HistGradientExpert:** Utilizes a `HistGradientBoostingClassifier` tuned by `GridSearchCV` to handle residual patterns and optimize decision boundaries on difficult feature subsets.
+- **Non Linear SVM:** Projects complex borderline cases into higher dimensional spaces using a kernel based `SVC` (with balanced class weights and probability calibration) to find smooth geometric separation where standard trees break down.
+- **ClinicalProfileExpert (LogReg + KNN):** Combines calibrated linear risk weights (`LogisticRegression`) with the physiological distance to historical records (`KNeighborsClassifier`) through a soft voting ensemble.
+- **Non Linear MLP:** Models dense, continuous interactions of metabolic collapse for patients in profound neurogenic shock using multi layer perceptrons optimized with `HalvingGridSearchCV`.
 
 ### Spatial Vision
 Instead of relying solely on tabular data, the system directly processes raw CT scans, identifying structural pathologies that dictate long term functional recovery and pose the steepest rehabilitation challenges:
