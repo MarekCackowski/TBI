@@ -13,7 +13,7 @@ GCS is blind to what happens inside the skull. This project is physical proof of
 
 The system was designed for a high risk environment where minimizing missed critical patients is an absolute priority. The architecture relies on **late multimodal fusion**, integrating data from 4 independent pipelines:
 
-### 1. Tabular Cascade & Phenotyping
+### Tabular Cascade & Phenotyping
 Processing structured data from life support equipment and medical history through a multi stage defense line designed to overcome the rigidity of standard algorithms:
 -   **Data Quality Guardrails:** Automated ETL validation suite enforcing strict schema types, uniqueness checks, and physiological range assertions before data enters the persistence layer.
 -   **Tabular Cascade & Auto Noising (`RLAutoNoiseAgent`):** A reinforcement learning agent that dynamically injects structured noise during training. This forces the model to ignore subjective human scoring errors (such as inconsistent nursing entries for GCS or APACHE) and learn true underlying physiological fragility.
@@ -24,13 +24,13 @@ Processing structured data from life support equipment and medical history throu
 -   **TabNet:** Applies sequential attention mechanisms over tabular features to mimic human feature selection and reasoning.
 -   **Phase 2: GMM Phenotype Router & Isolation Forest (Borderline Stratification):** Standard decision trees split feature space along strict right angles, which catastrophically fails for complex, borderline ICU patients whose multi system failure cannot be boxed into axis aligned rules. To solve this, **Isolation Forest** first isolates out of distribution anomalies, while a **Gaussian Mixture Model** performs soft clustering to map patients into distinct physiological phenotypes based on multidimensional distance.
 
-### 2. Specialist Model Routing (Targeted Decision Making)
+### Specialist Model Routing (Targeted Decision Making)
 Rather than forcing a single architecture to handle everything, ambiguous and high risk cases identified by the router are dynamically delegated to specialized mathematical paradigms:
 -   **Non Linear SVM:** Projects complex borderline cases into higher dimensional spaces to find smooth, robust geometric separation boundaries where tree margins break down.
 -   **LogReg + KNN:** Evaluates the physiological distance to historical survivors and non survivors using nearest neighbor metrics combined with calibrated linear risk weights.
 -   **Non Linear MLP:** Models dense, continuous interactions of metabolic collapse for patients in profound neurogenic shock whose trajectories defy discrete rule based logic.
 
-### 3. Spatial Vision
+### Spatial Vision
 Instead of relying solely on tabular data, the system directly processes raw CT scans, identifying structural pathologies that dictate long term functional recovery and pose the steepest rehabilitation challenges:
 
 - **CRNN (Hemorrhage & Volumetric Mass Effect Cascades):** Sequential analysis of brain slices enhanced by a *Slice Attention* mechanism for multilabel classification of hemorrhages and tracking the 3D spatial dynamics of mass lesions and tumors.
@@ -42,7 +42,7 @@ Instead of relying solely on tabular data, the system directly processes raw CT 
 - **DenseNet 3D + ViT (Calvarial & Skull Base Fractures):** A network operating on the bone window combined with a Vision Transformer to instantly detect advanced calvarial and skull base fractures by capturing global spatial context across volumetric slices.
 *Clinical Impact:* Beyond compromising structural skull integrity, basal fractures frequently tear the dura mater or impinge on cranial nerves and major cerebral vessels, risking catastrophic cerebrospinal fluid leaks, intracranial infections, and permanent sensory motor losses.
 
-### 4. Holistic Judge & Dynamic Trajectory
+### Holistic Judge & Dynamic Trajectory
 Combining logits from all modalities into a final life saving decision:
 -   **EBM & Logistic Regression:** Ensure decision transparency and rule extraction.
 -   **Cost Sensitive Hard Mining:** Implementation of OHEM with a heavy penalty for unpredicted fatalities and unexpected survivors.
@@ -51,7 +51,7 @@ Combining logits from all modalities into a final life saving decision:
 
 ---
 
-### 5. Domain Adaptation & Hospital Deployment
+### Domain Adaptation & Hospital Deployment
 Deploying a model from a research database to a new hospital environment inherently risks *Domain Shift* caused by calibration differences in monitoring hardware, varying acquisition protocols, or local documentation habits. The system natively addresses this through **Meta Level Transfer Learning**:
 -   **Core Backbone Freezing:** Heavy convolutional extractors and specialized vision weights remain locked, preserving robust anatomical feature representations.
 -   **Local Judge Recalibration:** Utilizing a small local cohort from the target ICU, the system rapidly adapts its final Meta Judge layer to local measurement baselines, eliminating hardware biases in real time and restoring peak predictive calibration without requiring full model retraining.
