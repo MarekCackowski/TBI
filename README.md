@@ -36,7 +36,7 @@ Standard decision trees split feature space along strict right angles, which cat
 Rather than forcing a single architecture to handle everything, ambiguous and high-risk cases identified by the router are dynamically delegated to specialized mathematical paradigms:
 - **HistGradientExpert:** Utilizes a `HistGradientBoostingClassifier` tuned by `GridSearchCV` to handle residual patterns and optimize decision boundaries on difficult feature subsets.
 - **Non Linear SVM:** Projects complex borderline cases into higher dimensional spaces using a kernel based `SVC` (with balanced class weights and probability calibration) to find smooth geometric separation where standard trees break down.
-- **ClinicalProfileExpert (LogReg + KNN):** Combines calibrated linear risk weights (`LogisticRegression`) with the physiological distance to historical records (`KNeighborsClassifier`) through a soft voting ensemble.
+- **Clinical Profile Expert (LogReg + KNN):** Combines calibrated linear risk weights (`LogisticRegression`) with the physiological distance to historical records (`KNeighborsClassifier`) through a soft voting ensemble.
 - **Non Linear MLP:** Models dense, continuous interactions of metabolic collapse for patients in profound neurogenic shock using multi layer perceptrons optimized with `HalvingGridSearchCV`.
 
 ### Spatial Vision
