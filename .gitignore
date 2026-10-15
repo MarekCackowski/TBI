@@ -1,0 +1,21 @@
+# Python / Environment
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.env
+
+# Data & Large Files & Weights
+Data/
+output_data/
+downloads/
+*.pth
+*.zip
+*.tar.gz
+*.nii
+*.dcm
+
+# IDE / OS specific
+.idea/
+.vscode/
+.DS_Store
