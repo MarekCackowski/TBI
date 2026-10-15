@@ -1,0 +1,138 @@
+version: '3.8'
+
+services:
+  # PostgreSQL: TimescaleDB dla telemetrii ICU i historycznych danych pacjentów
+  tbi_postgres:
+    image: timescale/timescaledb:latest-pg15
+    container_name: tbi_postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: tbi_database
+    command: postgres -c shared_buffers=2GB -c work_mem=64MB -c maintenance_work_mem=512MB -c effective_cache_size=6GB -c max_connections=200
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d tbi_database && psql -U postgres -d tbi_database -c 'SELECT 1;'"]
+      interval: 3s
+      timeout: 3s
+      retries: 5
+    ports:
+      - "6543:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
+  
+  # Redis: szybki cache na embeddingi i statyczne cechy pacjentów
+  tbi_redis:
+    image: redis:alpine
+    container_name: tbi_redis
+    command: redis-server --maxmemory 2gb --maxmemory-policy volatile-lru --appendonly yes
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
+
+  # MongoDB: baza dokumentowa na nieustrukturyzowane dane pacjentów
+  tbi_mongo:
+    image: mongo:latest
+    container_name: tbi_mongo
+    command: ["mongod", "--wiredTigerCacheSizeGB", "4"]
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
+
+  # MinIO: przechowywanie danych obrazów i plików
+  #tbi-minio:  # Przy MinIO nie można _, bo w nazwach kontenerów i hostów są problemy z DNS-em, więc używamy myślnika
+    #image: cgr.dev/chainguard/minio:latest # Używamy chainguard, bo oficjalny obraz MinIO ma problemy z DNS-em i nie działa w Docker Compose
+    #container_name: tbi-minio
+    #environment:
+      #MINIO_ROOT_USER: ${MINIO_USER}
+      #MINIO_ROOT_PASSWORD: ${MINIO_PASSWORD}
+    #command: server /data --console-address ":9001"
+    #ports:
+      #- "9002:9000"
+      #- "9003:9001"
+    #volumes:
+      #- minio_data:/data
+    #restart: unless-stopped
+  tbi-minio:
+    image: cgr.dev/chainguard/minio:latest # Używamy chainguard, bo oficjalny obraz MinIO ma problemy z DNS-em i nie działa w Docker Compose
+    container_name: tbi-minio
+    environment:
+      MINIO_ROOT_USER: ${MINIO_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_PASSWORD}
+    command: server /data --console-address ":9001"
+    ports:
+      - "9002:9000"
+      - "9003:9001"
+    volumes:
+      - ./local_minio_data:/data
+    restart: unless-stopped
+
+  tbi_app:
+    build: .
+    container_name: tbi_app
+    shm_size: '16gb' # Zapobiega błędom pamięci współdzielonej DataLoaderów
+    ipc: host # Używamy host dla szybkiej komunikacji procesów i transferu tensorów GPU
+    env_file:
+      - .env
+    volumes:
+      - .:/app
+    depends_on:
+      tbi_postgres:
+        condition: service_healthy
+      tbi_mongo:
+        condition: service_healthy
+      tbi_redis:
+        condition: service_healthy # Sprawdzamy, czy wszystkie używane bazy danych są gotowe przed uruchomieniem aplikacji TBI
+      tbi-minio:
+        condition: service_started # MinIO wystartowanie może zająć trochę dłużej, a potrzebujemy go dopiero po 
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    tty: true # Umożliwia interaktywną sesję w kontenerze, np. do debugowania lub uruchamiania skryptów
+    environment:
+      - PYTHONUNBUFFERED=1 # Natychmiastowe logi w konsoli, bez buforowania
+      - TZ=Europe/Warsaw # Stała strefa czasowa dla logów i harmonogramów zadań, żeby uniknąć problemów z czasem letnim/zimowym
+    restart: unless-stopped
+    logging:
+      driver: "json-file" # Logowanie w formacie JSON, łatwe do analizy i integracji z narzędziami monitorującymi
+      options:
+        max-size: "50m" # Ogranicza rozmiar pojedynczego pliku logu do 50 MB, aby uniknąć zapełnienia dysku
+        max-file: "3" # Ogranicza liczbę plików logu do 3, aby uniknąć zapełnienia dysku
+
+volumes:
+  postgres_data:
+  mongo_data:
+  redis_data:

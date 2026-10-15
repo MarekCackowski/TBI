@@ -1,0 +1,65 @@
+# ==========================================
+# BAZY DANYCH I INTEGRACJA
+# ==========================================
+sqlalchemy>=2.0.0        # ORM i obsługa połączeń z bazą danych
+psycopg2-binary>=2.9.0   # Sterownik PostgreSQL dla SQLAlchemy
+pymongo>=4.0.0           # Obsługa bazy danych MongoDB
+redis>=4.5.0             # Klient pamięci podręcznej i systemu alertów
+python-dotenv>=1.0.0     # Ładowanie bezpiecznych zmiennych środowiskowych z pliku .env
+boto3>=1.28.0            # Główny klient kompatybilny z S3 (używany w kodzie do MinIO)
+minio>=7.2.0             # Natywny klient Python SDK dla MinIO
+
+# ==========================================
+# PRZETWARZANIE DANYCH I MACIERZE
+# ==========================================
+numpy>=1.24.0,<2.0.0     # Szybkie operacje matematyczne (wersja <2.0 wymagana przez PyTorch)
+pandas>=2.0.0            # Zarządzanie strukturami danych pacjentów
+scikit-learn>=1.3.0      # Klasyfikatory, walidacja krzyżowa, metryki ewaluacyjne
+
+# ==========================================
+# GŁĘBOKIE UCZENIE I MODELE WIZYJNE (PyTorch)
+# ==========================================
+# Sugerowana instalacja PyTorch dla GPU z oficjalnego repozytorium (pip automatycznie dobierze backend)
+torch>=2.0.0             # Główny silnik PyTorch
+torchvision>=0.15.0      # Przetwarzanie obrazów dla sieci wizyjnych
+timm>=0.9.0              # PyTorch Image Models (DenseNet itp.)
+torchdiffeq>=0.2.3       # Solver równań różniczkowych dla Neural ODE
+pytorch-tabnet>=0.4.0    # TabNet dla danych tabelarycznych
+transformers==4.39.3     # Modele językowe Hugging Face
+
+# ==========================================
+# SILNIKI ENSEMBLE I MODELI KLASYCZNYCH
+# ==========================================
+xgboost>=1.7.0           # XGBoost Classifier
+lightgbm>=4.0.0          # LightGBM Classifier
+catboost>=1.2.0          # CatBoost Classifier
+interpret>=0.3.0         # Explainable Boosting Classifier (EBM)
+imbalanced-learn>=0.11.0 # Narzędzia under/oversampling (imblearn)
+
+# ==========================================
+# MEDYCZNE FORMATY DANYCH I OBRAZOWANIE
+# ==========================================
+pydicom>=2.4.0           # Odczyt plików DICOM (skany tomografu)
+nibabel>=4.0.0           # Obsługa formatów NIfTI (.nii)
+opencv-python>=4.8.0     # Zmieniono z headless, aby uniknąć problemów w przypadku lokalnego wyświetlania (cv2.imshow)
+Pillow>=10.0.0           # Podstawowa obsługa i konwersja grafik
+
+# ==========================================
+# OPTYMALIZACJA, XAI I WIZUALIZACJA
+# ==========================================
+optuna>=3.0.0            # Optymalizacja hiperparametrów (TPE, Pruner)
+shap>=0.41.0             # Wyjaśnialność modeli (SHAP values)
+imodels>=1.4.0           # Wyjaśnialność modeli (SkopeRules, SkopeTree)
+matplotlib>=3.7.0        # Generowanie wykresów ewaluacyjnych i krzywych
+seaborn>=0.12.0          # Wizualizacje statystyczne
+statsmodels>=0.14.0      # Statystyka i testy McNemara
+
+# ==========================================
+# NARZĘDZIA POMOCNICZE
+# ==========================================
+pydantic>=2.0.0          # Walidacja danych i konfiguracji
+pydantic-settings>=2.0.0 # Zarządzanie konfiguracją środowiskową
+joblib>=1.3.0            # Równoległość i serializator modeli
+requests>=2.31.0         # Obsługa zapytań HTTP
+tqdm>=4.66.0             # Paski postępu w konsoli
+kaggle>=1.5.16           # Pobieranie zbiorów danych z Kaggle
