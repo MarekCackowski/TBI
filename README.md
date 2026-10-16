@@ -20,12 +20,13 @@ Processing structured data from life support equipment and medical history throu
 * **Data Quality Guardrails:** Automated ETL validation suite enforcing strict schema types, uniqueness checks, and physiological range assertions before data enters the persistence layer.
 * **Tabular Cascade & Auto Noising (`RLAutoNoiseAgent`):** A reinforcement learning agent that dynamically injects structured noise during training. This forces the model to ignore subjective human scoring errors (such as inconsistent nursing entries for GCS or APACHE) and learn true underlying physiological fragility.
 
-#### Phase 1: Asymmetric Tree Ensemble (Broad Screening)
-Rejecting bagging in favor of gradient boosting algorithms that aggressively minimize residuals on critical cases. This phase combines distinct algorithms tailored for their complementary strengths:
-* **XGBoost:** Provides precise residual regularization to prevent overfitting on noisy medical telemetry.
-* **LightGBM:** Utilizes leaf wise growth optimized to capture non linear interactions across high dimensional features.
-* **CatBoost:** Employs symmetrically built trees to completely prevent feature overfitting on severe minority mortality classes.
-* **TabNet:** Applies sequential attention mechanisms over tabular features to mimic human feature selection and reasoning.
+#### Phase 1: Asymmetric Boosting & Probabilistic Anchor (Broad Screening)
+Rejecting traditional bagging in favor of an ensemble driven by gradient boosting algorithms that aggressively minimize residuals on critical cases, reinforced by an independent probabilistic paradigm. This phase combines distinct algorithms tailored for their complementary strengths:
+- **XGBoost:** Provides precise residual regularization to prevent overfitting on noisy medical telemetry.
+- **LightGBM:** Utilizes leaf wise growth optimized to capture non linear interactions across high dimensional features.
+- **CatBoost:** Employs symmetrically built trees to completely prevent feature overfitting on severe minority mortality classes.
+- **TabNet:** Applies sequential attention mechanisms over tabular features to mimic human feature selection and reasoning.
+- **Bernoulli Naive Bayes (Red Flag Anchor):** Injects a completely different, discrete mathematical paradigm into the continuous boosting cascade. By operating purely on binary probabilities, it acts as a high sensitivity alarm for isolated physiological extremes, preventing acute critical signals from being smoothed out or averaged away by the residual minimization of the tree algorithms.
 
 #### Phase 2: GMM Phenotype Router & Isolation Forest (Borderline Stratification)
 Standard decision trees split feature space along strict right angles, which catastrophically fails for complex, borderline ICU patients whose multi system failures cannot be boxed into axis aligned rules. To solve this:
