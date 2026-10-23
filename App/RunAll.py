@@ -68,9 +68,12 @@ def verify_database_schema():
         return False
 
 
-def run_step(script_path, expected_output=None, optional=False, expected_file=None):
+def run_step(script_path, expected_output=None, optional=False, expected_file=None, eval_if_exists=False):
     """ Uruchamia wskazany skrypt Pythona i monitoruje jego status. 
-        Sprawdza obecność plików wyjściowych, obrazów oraz opcjonalnego pliku (np. labels.csv). """
+        Sprawdza obecność plików wyjściowych, obrazów oraz opcjonalnego pliku. """
+    env = os.environ.copy()
+    env["PYTHONPATH"] = os.getcwd()
+    
     def has_images(folder):
         if not os.path.exists(folder): 
             return False
@@ -80,7 +83,6 @@ def run_step(script_path, expected_output=None, optional=False, expected_file=No
         return False
 
     if expected_output:
-        # Sprawdzamy dodatkowo, czy wymagany plik (np. labels.csv) również istnieje
         file_check_passed = True
         if expected_file:
             target_file_path = os.path.join(expected_output, expected_file) if os.path.isdir(expected_output) else expected_file
@@ -89,15 +91,24 @@ def run_step(script_path, expected_output=None, optional=False, expected_file=No
 
         if os.path.isdir(expected_output):
             if has_images(expected_output) and file_check_passed:
-                logger.info(f"Znaleziono gotowy wynik z obrazami i plikiem '{expected_file}' w: '{expected_output}'.")
-                logger.info(f"Pomijam wykonywanie skryptu: {script_path}\n")
-                return
+                if eval_if_exists:
+                    logger.info(f"Znaleziono gotowy wynik w: '{expected_output}'. Uruchamiam skrypt w trybie samej ewaluacji.")
+                    env["EVAL_ONLY"] = "1"
+                else:
+                    logger.info(f"Znaleziono gotowy wynik z obrazami i plikiem '{expected_file}' w: '{expected_output}'.")
+                    logger.info(f"Pomijam wykonywanie skryptu: {script_path}")
+                    return
             else:
                 logger.info(f"Folder '{expected_output}' istnieje, ale brakuje w nim obrazów lub pliku '{expected_file}'. Uruchamiam skrypt.")
+                
         elif os.path.exists(expected_output) and file_check_passed:
-            logger.info(f"Znaleziono gotowy plik wyjściowy: '{expected_output}'.")
-            logger.info(f"Pomijam wykonywanie skryptu: {script_path}\n")
-            return
+            if eval_if_exists:
+                logger.info(f"Znaleziono gotowy plik wyjściowy: '{expected_output}'. Uruchamiam skrypt w trybie samej ewaluacji.")
+                env["EVAL_ONLY"] = "1"
+            else:
+                logger.info(f"Znaleziono gotowy plik wyjściowy: '{expected_output}'.")
+                logger.info(f"Pomijam wykonywanie skryptu: {script_path}")
+                return
 
     logger.info(f"Rozpoczynanie wykonywania skryptu: {script_path}")
     
@@ -110,9 +121,6 @@ def run_step(script_path, expected_output=None, optional=False, expected_file=No
             sys.exit(1)
 
     try:
-        env = os.environ.copy()
-        env["PYTHONPATH"] = os.getcwd()
-
         result = subprocess.run([sys.executable, "-u", script_path], env=env)
         
         if result.returncode != 0:
@@ -143,10 +151,20 @@ if __name__ == "__main__":
         run_step(os.path.join("Data", "PrepareMimicDB.py"))
 
     # Przygotowanie danych wizyjnych
-    run_step(os.path.join("Data", "PrepareVisionData.py"), expected_output=os.path.join("Data", "dataset_ct_main"), expected_file="labels.csv")
+    weights_path = os.path.join("output_data", "Models", "resnet_50_23dataset.pth")
+    
+    if not os.path.exists(weights_path):
+        logger.info(f"Brakuje wag wizyjnych ({weights_path}). Wymuszam uruchomienie PrepareVisionData.py.")
+        run_step(os.path.join("Data", "PrepareVisionData.py"))
+    else:
+        run_step(os.path.join("Data", "PrepareVisionData.py"), expected_output=os.path.join("Data", "dataset_ct_main"), expected_file="labels.csv")
 
-    # Trening CRNN
-    run_step(os.path.join("Models", "IntracranialHemorrhage_CRNN.py"), expected_output=os.path.join("output_data", "Models", "crnn_fine_uncertainty.pth"))
+    # Trening CRNN (teraz wymusza ewaluację, jeśli wagi istnieją)
+    run_step(
+        os.path.join("Models", "IntracranialHemorrhage_CRNN.py"), 
+        expected_output=os.path.join("output_data", "Models", "crnn_fine_uncertainty.pth"),
+        eval_if_exists=True
+    )
 
     # Trening UNet i EfficientNet
     run_step(os.path.join("Models", "ModzelBody_UNet_to_EfficientNet.py"), expected_output=os.path.join("output_data", "Models", "efficientnet_corpus_callosum_finetune.pth"))

@@ -4,6 +4,7 @@ __pycache__/
 *$py.class
 venv/
 .env
+*.json
 
 # Data & Large Files & Weights
 Data/
@@ -14,6 +15,7 @@ downloads/
 *.tar.gz
 *.nii
 *.dcm
+local_minio_data/
 
 # IDE / OS specific
 .idea/
