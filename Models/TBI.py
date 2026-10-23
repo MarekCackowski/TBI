@@ -25,6 +25,7 @@ import re
 import sys
 import datetime
 from PIL import Image
+from torch.distributions import Beta
 import optuna
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from optuna.samplers import TPESampler
@@ -106,6 +107,8 @@ import scipy.stats as stats
 from sklearn.ensemble import IsolationForest
 import statsmodels.api as sm
 from imodels import SkopeRulesClassifier
+from sklearn.cluster import AgglomerativeClustering
+from sklearn.decomposition import SparsePCA
 
 # Zapis modeli i obsługa wielowątkowości
 import joblib
@@ -128,14 +131,6 @@ from botocore.exceptions import ClientError, BotoCoreError
 from pydantic import BaseModel, Field, model_validator, ValidationError
 from typing import Dict, Any, List, Optional, Tuple
 import datetime
-
-# Inicjalizacja systemu logowania
-logging.basicConfig(
-    level=logging.INFO,
-    format='[%(asctime)s] %(levelname)s\n%(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
-)
-logger = logging.getLogger(__name__)
 
 # Bezpieczny import solve'ra Neural ODE
 try:
@@ -166,6 +161,41 @@ load_dotenv()
 
 # Dynamiczne wykrywanie ścieżki do głównego katalogu projektu
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+# Inicjalizacja systemu logowania dla ostatecznego modułu
+def setup_logger(name: str = "multimodal_cascade"):
+    """ Centralny logger: konsole kieruje przez tqdm.write (nie rozbija paskow postepu),
+        a kopie zapisuje do pliku. Zabezpieczony przed podwojna rejestracja handlerow. """
+    logger = logging.getLogger(name)
+    if logger.handlers:
+        return logger
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+
+    fmt = logging.Formatter('[%(asctime)s] %(levelname)s: %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+
+    class _TqdmStream:
+        """ Strumien przekazujacy logi przez tqdm.write, zeby pasek sie nie dublowal. """
+        @classmethod
+        def write(cls, msg):
+            if msg.strip():
+                sys.__stdout__.write(msg + "\n")
+                sys.__stdout__.flush()
+        def flush(self, *args, **kwargs):
+            if hasattr(sys.__stdout__, "flush"):
+                sys.__stdout__.flush()
+
+    ch = logging.StreamHandler(_TqdmStream)
+    ch.setFormatter(fmt)
+    fh = logging.FileHandler("crnn_training.log", encoding="utf-8")
+    fh.setFormatter(fmt)
+
+    logger.addHandler(ch)
+    logger.addHandler(fh)
+    return logger
+
+
+logger = setup_logger()
 
 
 class Settings(BaseSettings):
@@ -397,59 +427,67 @@ class RealTimePatientBuffer:
             if not self.r.exists(f"patient:{hadm_id}:{cat}"):
                 return False
         return True
-    
-
-def drop_m1_prob(X):
-    """ Usuwanie kolumny z prawdopodobieństwami modelu 1, jeśli istnieje.
-        I tak jest używana przy przekazywaniu decyzji obu modeli do meta-modelu, więc niepotrzebnie duplikować. """
-    if isinstance(X, pd.DataFrame) and 'model_1_prob' in X.columns:
-        return X.drop(columns=['model_1_prob'])
-    return X
 
 
-class RLAutoNoiseAgent(nn.Module):
-    """ Agent RL uczący się optymalnej polityki zaszumiania danych tabelarycznych. """
-    def __init__(self, state_dim=1, action_dim=3, lr=1e-3):
+class RLAutoAugmentAgent(nn.Module):
+    """ Agent z pamięcią akcji: stan to teraz [strata, anatomia, symetria, p_affine, p_elastic, p_blur, p_jitter, p_erase]. 
+        Po to, żeby agent mógł uczyć się, które augmentacje są skuteczne w dłuższej perspektywie, a które nie. Jego optymalizacja
+        składa się z dwóch nagród: poprawy F1 (task_reward) i zachowania anatomii (struct_reward). W ten sposób agent uczy się
+        kompromisu między agresywnymi augmentacjami a zachowaniem biologii w sposób umożliwiający poprawne rozpoznawanie. 
+        W przyszłości warto myśleć o wprowadzeniu rywalizującego agenta, który będzie starał się punktowo poprawić jakość ciała modzelowatego,
+        które jest dość niewyraźne na skanach CT, a agent główny będzie musiał balansować, żeby zniekształcenia mimo wszystko były akceptowalne. """
+    def __init__(self, state_dim=8, action_dim=5, lr=1e-3, struct_lambda=0.2):
         super().__init__()
+        self.struct_lambda = struct_lambda
 
-        # Akcje to mnożniki szumu dla 3 grup: 1. Skale (GCS/APACHE), 2. Aparatura (Vitals), 3. Reszta
-        self.policy_network = nn.Sequential(
+        self.actor = nn.Sequential(
             nn.Linear(state_dim, 32),
             nn.ReLU(),
-            nn.Linear(32, action_dim),
-
-            # Używamy Sigmoid, aby Agent zwracał mnożniki bazowe w zakresie [0.0, 1.0], później będą przeskalowane
-            nn.Sigmoid() 
+            nn.Linear(32, action_dim * 2) 
         )
-        self.optimizer = optim.Adam(self.policy_network.parameters(), lr=lr)
         
-    def select_noise_scales(self, current_metric):
-        # Sprawdzamy urządzenie, na którym fizycznie leży Agent
-        device = next(self.parameters()).device
+        self.critic = nn.Sequential(
+            nn.Linear(state_dim, 32),
+            nn.ReLU(),
+            nn.Linear(32, 1)
+        )
         
-        # Tworzymy stan od razu na tym urządzeniu
-        state = torch.tensor([[current_metric]], dtype=torch.float32, device=device)
-        scales = self.policy_network(state)
+        self.optimizer = optim.Adam(list(self.actor.parameters()) + list(self.critic.parameters()), lr=lr)
         
-        # Wymuszamy zrzut pamięci z powrotem na CPU przed konwersją do NumPy
-        return scales.detach().cpu().numpy()[0]
+        self.last_log_prob = None
+        self.last_entropy = None
+        self.last_state = None
+
+        # Pamięć startowa (początkowo wyzerowana)
+        self.last_actions_memory = np.zeros(action_dim, dtype=np.float32)
+
+    def select_augmentations(self, current_loss, struct_score=1.0, symmetry_score=1.0, deterministic=False):
+        # Stan rozszerzony o to, jakich akcji agent użył w poprzedniej epoce
+        metrics = [current_loss, struct_score, symmetry_score]
+        state_list = metrics + self.last_actions_memory.tolist()
         
-    def update(self, current_metric, reward):
-        # Sprawdzamy urządzenie
-        device = next(self.parameters()).device
+        state = torch.tensor([state_list], dtype=torch.float32, device=DEVICE)
+        self.last_state = state
         
-        # Upewniamy się, że zarówno stan, jak i nagroda, leżą na tym samym sprzęcie
-        state = torch.tensor([[current_metric]], dtype=torch.float32, device=device)
-        reward_tensor = torch.tensor(reward, dtype=torch.float32, device=device)
+        params = self.actor(state)
         
-        scales = self.policy_network(state)
+        alpha = func.softplus(params[:, :5]) + 1.0
+        beta = func.softplus(params[:, 5:]) + 1.0
+        dist = Beta(alpha, beta)
         
-        # Policy Gradient: operacje w pełni zsynchronizowane
-        loss = -torch.log(scales + 1e-8).mean() * reward_tensor 
+        if deterministic:
+            actions = alpha / (alpha + beta)
+        else:
+            actions = dist.sample()
+            self.last_log_prob = dist.log_prob(actions).sum(dim=-1)
+            self.last_entropy = dist.entropy().sum(dim=-1)
+            
+        actions_np = actions.detach().cpu().numpy()[0]
         
-        self.optimizer.zero_grad()
-        loss.backward()
-        self.optimizer.step()
+        # Zapisanie akcji do pamięci na potrzeby kolejnego kroku
+        self.last_actions_memory = actions_np
+        
+        return actions_np
 
 
 class AdaptiveMedicalNoiseAdder(BaseEstimator, TransformerMixin):
@@ -664,17 +702,20 @@ class MedicalCascadePredictor(BaseEstimator, ClassifierMixin):
             ]
             
             meta_features = np.column_stack(meta_list)
+            base_names_meta = ['Konsylium', 'Eksperci', 'CRNN', 'EfficientNet', 'DenseNet']
             
-            expected_features = getattr(self.judge, 'n_features_in_', meta_features.shape[1])
-            if meta_features.shape[1] < expected_features:
-                padding = np.full((meta_features.shape[0], expected_features - meta_features.shape[1]), 0.5)
-                meta_features = np.column_stack((meta_features, padding))
+            # Przekazanie DataFrame pozwala EBM na poprawne mapowanie nazw cech
+            meta_features_df = pd.DataFrame(meta_features, columns=base_names_meta, index=X_raw[needs_stage_3].index)
+            
+            expected_features = getattr(self.judge, 'n_features_in_', meta_features_df.shape[1])
+            if meta_features_df.shape[1] < expected_features:
+                padding = np.full((meta_features_df.shape[0], expected_features - meta_features_df.shape[1]), 0.5)
+                padding_df = pd.DataFrame(padding, columns=[f'pad_{i}' for i in range(padding.shape[1])], index=meta_features_df.index)
+                meta_features_df = pd.concat([meta_features_df, padding_df], axis=1)
                 
-            prob_final_hard = self.judge.predict_proba(meta_features)[:, 1]
-            diff_stage3 = prob_spec[needs_stage_3] - 0.5
-            weight_stage3 = 1 / (1 + np.exp(-10 * diff_stage3)) 
-            
-            final_probs[needs_stage_3] = (1 - weight_stage3) * prob_spec[needs_stage_3] + weight_stage3 * prob_final_hard
+            # EBM przyjmuje surowe prawdopodobieństwa i optymalizuje wagi
+            prob_final_hard = self.judge.predict_proba(meta_features_df)[:, 1]
+            final_probs[needs_stage_3] = prob_final_hard
 
         return np.column_stack((1 - final_probs, final_probs))
 
@@ -705,9 +746,9 @@ class CustomClassifierPipeline(ImbPipeline):
 
 
 class PhenotypeTournamentRouter(BaseEstimator, ClassifierMixin):
-    """ Dynamiczny Router Fenotypów.
-        Unikamy rotacji przestrzeni, która niszczy naturalne znaczenie cech tabelarycznych. Zamiast tego używamy
-        selekcji cech opartej na drzewach, aby wyeliminować szum i ułatwić GMM znalezienie prawdziwych podgrup medycznych pacjentów. """
+    """ Dynamiczny Router Fenotypów z hybrydowym klastrowaniem kontekstowym (Hierarchiczne + GMM + Sparse PCA).
+        Rozdziela pacjentów na specyficzne podgrupy kliniczne (np. urazy wysokenergetyczne u młodych oraz profil geriatryczny),
+        stosując dedykowane metody redukcji szumu i przestrzeni cech. """
         
     _estimator_type = "classifier"
 
@@ -719,31 +760,16 @@ class PhenotypeTournamentRouter(BaseEstimator, ClassifierMixin):
         self.max_clusters = max_clusters
         self.min_patients_per_cluster = min_patients_per_cluster
         
-        """ Odrzucenie PCA przed klastrowaniem wynika z jej sztywnego charakteru. PCA nie usuwa szumu,
-            lecz dokonuje matematycznej rotacji przestrzeni, tworząc abstrakcyjne kombinacje liniowe.
-            Skutkuje to zmieszaniem twardych parametrów ratunkowych z wahaniami cech nie wnoszących zbyt
-            dużej wartości. Zgodnie z badaniami (Grinsztajn et al., 2022), dane tabelaryczne tracą swoje
-            właściwości pod wpływem rotacji. Zmuszenie algorytmu GMM do pracy na takich składowych sprawia, 
-            że grupuje on pacjentów bazując na czystej, ogólnej wariancji, a nie logice medycznej.
-            Zastosowanie Random Forest odwraca ten paradygmat:
-            Zamiast obracać wymiary, Las Losowy w sposób nadzorowany ocenia siłę predykcyjną 
-            każdej zmiennej pod kątem ryzyka zgonu pacjenta, a następnie fizycznie odcina szum.
-            Pozostałe cechy nie ulegają żadnej transformacji, dzięki czemu nienadzorowany algorytm GMM
-            szuka fenotypów w czystej, fizjologicznej przestrzeni.
-
-            Uzasadnienie dobranych hiperparametrów:
-            max_depth=5: Płytkie drzewa celowo blokują modelowi możliwość przeuczenia i wymusza większe
-            skupienie na wartościowych cechach.
-            n_estimators=50: Zapewnia stabilne uśrednienie wariancji i posortowanie ważności cech,
-            bez znacznego wpływu na wydajność.
-            max_features=25: Bufor odcięcia. W medycynie ratunkowej rdzeń hemodynamiczno-
-            -neurologiczny to zazwyczaj około 15-20 kluczowych zmiennych. Pozostawienie 25 osi 
-            gwarantuje zachowanie całego kontekstu przy drastycznym ucięciu szumu. """
+        # Bazowa redukcja szumu przez Random Forest (ochrona przed niszczeniem cech tabelarycznych)
         self.reducer = SelectFromModel(
             RandomForestClassifier(n_estimators=50, max_depth=5, random_state=CONFIG["SEED"], n_jobs=-1),
             max_features=25
         )
-        self.clusterer_ = None
+        
+        # Specjalistyczne komponenty hybrydowe
+        self.sparse_pca = SparsePCA(n_components=3, alpha=1.0, random_state=CONFIG["SEED"])
+        
+        self.clusterers_ = {}
         self.models_ = []
         self.is_fitted_ = False
         self.fallback_model_ = None
@@ -759,61 +785,118 @@ class PhenotypeTournamentRouter(BaseEstimator, ClassifierMixin):
 
         X_cluster_space = X_arr.copy()
 
+        # Miękkie naprowadzenie algorytmu za pomocą wskazówek klinicznych
         if self.phenotype_hints and self.feature_names:
             for col_name, weight in self.phenotype_hints.items():
                 if col_name in self.feature_names:
                     idx = self.feature_names.index(col_name)
                     X_cluster_space[:, idx] *= weight
 
-        # Redukcja wymiarów przez odrzucenie śmieci, bez matematycznej rotacji
+        # Redukcja szumu przez Random Forest (wyciągamy najważniejsze osie decyzyjne)
         X_reduced = self.reducer.fit_transform(X_cluster_space, y_arr)
-
-        best_ch_score = -1.0
-        best_n_components = self.min_clusters
-        best_clusterer = None
-
-        logger.info("Szukam optymalnej liczby fenotypów (RF-Selection + Gaussian Mixture Models).")
         
-        for n in range(self.min_clusters, self.max_clusters + 1):
-            gmm_candidate = GaussianMixture(n_components=n, covariance_type='full', random_state=CONFIG["SEED"], n_init=3)
-            clusters = gmm_candidate.fit_predict(X_reduced)
+        #  Dynamiczny turniej struktur klastrowania i podgrup medycznych
+        logger.info("Uruchamiam dynamiczny turniej struktur klastrowania i podgrup medycznych.")
+        
+        # Sprawdzamy, czy mamy cechy pozwalające na inteligentne naprowadzenie
+        gcs_idx = self.feature_names.index('gcs_sum') if self.feature_names and 'gcs_sum' in self.feature_names else None
+        intubation_idx = self.feature_names.index('is_intubated') if self.feature_names and 'is_intubated' in self.feature_names else None
+        
+        # Jeśli dysponujemy indeksem GCS i intubacji, wykrywamy podgrupę konfundującą (np. rurka vs uraz)
+        clusters = np.zeros(len(X_arr), dtype=int)
+        
+        if gcs_idx is not None:
+            gcs_vals = X_arr[:, gcs_idx]
+            is_intub = X_arr[:, intubation_idx] if intubation_idx is not None else np.zeros(len(X_arr))
             
-            cluster_sizes = np.bincount(clusters)
-            smallest_cluster_size = np.min(cluster_sizes)
+            # Algorytmiczne wyznaczenie podgrupy wysokiego ryzyka artefaktu (np. głęboki spadek GCS przy obecności rurki)
+            confound_mask = (gcs_vals <= 8) & (is_intub == 1.0)
+            safe_mask = ~confound_mask
             
-            if smallest_cluster_size < self.min_patients_per_cluster:
-                logger.info(f"Odrzucono podział na {n} klastry (najmniejszy klaster to tylko {smallest_cluster_size} outlierów).")
+            subsets = []
+            if np.sum(confound_mask) >= self.min_patients_per_cluster:
+                subsets.append((confound_mask, "artefakt_drogi_oddechowej", 10))
+            if np.sum(safe_mask) >= self.min_patients_per_cluster:
+                subsets.append((safe_mask, "przestrzenie_standardowe", 20))
+        else:
+            # Jeśli brak dedykowanych kolumn, traktujemy całość jako jedną przestrzeń do podziału
+            subsets = [(np.ones(len(X_arr), dtype=bool), "globalna_populacja", 0)]
+
+        final_clusters = np.zeros(len(X_arr), dtype=int)
+        self.clusterers_ = {}
+
+        for mask, group_name, offset in subsets:
+            X_sub = X_reduced[mask]
+            if len(X_sub) < self.min_patients_per_cluster:
                 continue
-                
-            ch_score = calinski_harabasz_score(X_reduced, clusters)
-            if ch_score > best_ch_score:
-                best_ch_score = ch_score
-                best_n_components = n
-                best_clusterer = gmm_candidate
 
-        if best_clusterer is None:
-            logger.info("Żaden podział nie spełnił limitu pacjentów. Wymuszam bezpieczny podział na 2 grupy.")
-            best_n_components = 2
-            best_clusterer = GaussianMixture(n_components=2, covariance_type='full', random_state=CONFIG["SEED"], n_init=3)
-            best_clusterer.fit(X_reduced)
+            # Turniej algorytmów klastrowania dla danej podgrupy (GMM vs Hierarchical Ward)
+            candidate_clusterers = {
+                'GMM': GaussianMixture(n_components=2, covariance_type='full', random_state=CONFIG["SEED"], n_init=3),
+                'Ward': AgglomerativeClustering(n_clusters=2, linkage='ward')
+            }
+            
+            best_score = -1.0
+            best_labels = np.zeros(len(X_sub), dtype=int)
+            best_algo = None
+            best_algo_name = ""
 
-        self.clusterer_ = best_clusterer
-        logger.info(f"Ostatecznie wyodrębniono {best_n_components} zbalansowane klastry (Fenotypy GMM).")
+            for algo_name, cl_model in candidate_clusterers.items():
+                try:
+                    if hasattr(cl_model, 'fit_predict'):
+                        labels = cl_model.fit_predict(X_sub)
+                    else:
+                        labels = cl_model.fit(X_sub).labels_
+                        
+                    # Ocena jakości podziału (minimalny rozmiar klastra + Calinski-Harabasz)
+                    if np.min(np.bincount(labels)) < 15:
+                        continue
+                    score = calinski_harabasz_score(X_sub, labels)
+                    
+                    if score > best_score:
+                        best_score = score
+                        best_labels = labels
+                        best_algo = cl_model
+                        best_algo_name = algo_name
+                except (ValueError, RuntimeError, np.linalg.LinAlgError) as e:
+                    logger.warning(f"Błąd podczas dopasowywania {algo_name} dla podgrupy '{group_name}': {e}")
+                    continue
 
-        clusters = self.clusterer_.predict(X_reduced)
+            if best_algo is None:
+                # Awaryjny fallback na prosty podział
+                best_labels = np.zeros(len(X_sub), dtype=int)
+                best_algo = candidate_clusterers['GMM']
+                best_algo.fit(X_sub)
+                best_algo_name = "GMM_Fallback"
+
+            logger.info(f"   -> Podgrupa '{group_name}': Wybrano algorytm {best_algo_name} (Score: {best_score:.2f})")
+            
+            self.clusterers_[group_name] = best_algo
+            final_clusters[mask] = best_labels + offset
+
+        # Unifikacja klastrów
+        unique_clusters = np.unique(final_clusters)
+        cluster_mapping = {old_id: new_id for new_id, old_id in enumerate(unique_clusters)}
+        mapped_clusters = np.array([cluster_mapping[c] for c in final_clusters])
+        
+        self.cluster_mapping_ = cluster_mapping
+        best_n_components = len(unique_clusters)
+        self.clusterer_ = final_clusters
+
+        logger.info(f"Ostatecznie wyodrębniono {best_n_components} optymalnych fenotypów za pomocą dynamicznego turnieju.")
+
+        # Dalej standardowy turniej modelowy dla każdego wyodrębnionego fenotypu
         self.models_ = []
         tournament_scorer = make_scorer(fbeta_score, beta=CONFIG["BETA_MAIN"], zero_division=0)
 
         for i in range(best_n_components):
-            mask = (clusters == i)
+            mask = (mapped_clusters == i)
             X_cluster, y_cluster = X_arr[mask], y_arr[mask]
 
-            if len(np.unique(y_cluster)) < 2:
-                logger.info(f"   Klaster {i}: Brak reprezentacji obu klas. Używam modelu awaryjnego.")
+            if len(np.unique(y_cluster)) < 2 or len(X_cluster) < 10:
                 self.models_.append(self.fallback_model_)
                 continue
 
-            logger.info(f"   Klaster {i} (N={np.sum(mask)}): Start mini-turnieju.")
             best_score_turn = -1.0
             best_model_clone = None
             winning_name = ""
@@ -823,8 +906,6 @@ class PhenotypeTournamentRouter(BaseEstimator, ClassifierMixin):
                 scores = cross_val_score(clf, X_cluster, y_cluster, cv=3, scoring=tournament_scorer, n_jobs=1)
                 avg_score = scores.mean()
                 
-                logger.info(f"      - {name}: F-Beta = {avg_score:.4f}")
-                
                 if avg_score > best_score_turn:
                     best_score_turn = avg_score
                     best_model_clone = clf
@@ -832,10 +913,11 @@ class PhenotypeTournamentRouter(BaseEstimator, ClassifierMixin):
 
             best_model_clone.fit(X_cluster, y_cluster)
             self.models_.append(best_model_clone)
-            logger.info(f"   Zwycięzca dla Fenotypu {i}: {winning_name} (Wytrenowany i przypisany).")
+            logger.info(f"   Zwycięzca dla Fenotypu {i}: {winning_name}")
 
         self.is_fitted_ = True
         return self
+    
 
     def predict_proba(self, X):
         if not self.is_fitted_:
@@ -851,18 +933,41 @@ class PhenotypeTournamentRouter(BaseEstimator, ClassifierMixin):
                     X_cluster_space[:, idx] *= weight
 
         X_reduced = self.reducer.transform(X_cluster_space)
-        clusters = self.clusterer_.predict(X_reduced)
         
+        # Odtworzenie przypisania do klastrów hybrydowych podczas inferencji
+        age_idx = self.feature_names.index('age') if self.feature_names and 'age' in self.feature_names else None
+        clusters = np.zeros(len(X_arr), dtype=int)
+        
+        if age_idx is not None:
+            ages = X_arr[:, age_idx]
+            geriatric_mask = ages >= 75.0
+            severe_young_mask = (ages < 45.0)
+            
+            if 'geriatric' in self.clusterers_ and np.sum(geriatric_mask) > 0:
+                gmm_ger, spca = self.clusterers_['geriatric']
+                X_ger_sparse = spca.transform(X_reduced[geriatric_mask])
+                clusters[geriatric_mask] = gmm_ger.predict(X_ger_sparse) + 10
+                
+            if 'young_severe' in self.clusterers_ and np.sum(severe_young_mask) > 0:
+                # AgglomerativeClustering nie ma metody predict, dopasowujemy najbliższy centroid lub przypisujemy fallback
+                clusters[severe_young_mask] = 20
+
+        standard_mask = (clusters == 0)
+        if 'standard' in self.clusterers_ and np.sum(standard_mask) > 0:
+            clusters[standard_mask] = self.clusterers_['standard'].predict(X_reduced[standard_mask]) + 30
+
+        mapped_clusters = np.array([self.cluster_mapping_.get(c, 0) for c in clusters])
+
         probs = np.zeros((X_arr.shape[0], 2))
         for i, model in enumerate(self.models_):
-            mask = (clusters == i)
+            mask = (mapped_clusters == i)
             if np.sum(mask) > 0:
                 probs[mask] = model.predict_proba(X_arr[mask])
         return probs
 
     def predict(self, X):
         return (self.predict_proba(X)[:, 1] >= 0.5).astype(int)
-
+    
 
 def check_and_seed_database():
     """ Sprawdza czy baza jest pusta. Jeśli tak, generuje syntetyczne dane i zapisuje je do PostgreSQL, 
@@ -1440,7 +1545,7 @@ def extract_vitals_via_chunking(filepath, item_ids):
     chunk_iterator = pd.read_csv(filepath, compression='gzip', chunksize=1000000, usecols=['hadm_id', 'itemid', 'valuenum'])
     
     # TQDM do iteracji przez fragmenty pliku
-    for i, chunk in enumerate(tqdm(chunk_iterator, desc="Przetwarzanie paczek 1M wierszy", leave=False, file=sys.stdout, mininterval=2.0)):
+    for i, chunk in enumerate(tqdm(chunk_iterator, desc="Przetwarzanie paczek 1M wierszy", leave=False, mininterval=2.0)):
         # Filtrowanie tylko potrzebnych sensorów
         filtered = chunk[chunk['itemid'].isin(item_ids)].copy()
         
@@ -1472,11 +1577,11 @@ def extract_vitals_via_chunking(filepath, item_ids):
     
     # Wyliczamy ostateczne Globalne wartości dla pacjenta z sum wszystkich paczek
     final_df = concat_df.groupby(['hadm_id', 'itemid']).agg(
-        global_max=('chunk_max', 'max'),     # Max z maxów to po prostu Max
-        global_min=('chunk_min', 'min'),     # Min z minów to po prostu Min
-        global_sum=('chunk_sum', 'sum'),     # Suma z sum
-        global_count=('chunk_count', 'sum'), # Suma ilości pomiarów
-        global_sum_sq=('chunk_sum_sq', 'sum')# Suma z sum kwadratów
+        global_max=('chunk_max', 'max'),
+        global_min=('chunk_min', 'min'),
+        global_sum=('chunk_sum', 'sum'),
+        global_count=('chunk_count', 'sum'),
+        global_sum_sq=('chunk_sum_sq', 'sum')
     ).reset_index()
     
     # Średnia = Globalna Suma / Globalny Count
@@ -1652,10 +1757,22 @@ def load_trained_crnn_predictions(X_test, dataset_path='Data/dataset_ct_main', d
                     slices = slices + [slices[-1]] * (24 - len(slices))
                     
                 volume_tensor = torch.zeros((24, 3, 160, 160))
+                volume_tensor = torch.zeros((30, 3, 224, 224))
                 for i, slice_file in enumerate(slices):
+                    if i >= 30:  # Zabezpieczenie przed błędem IndexError
+                        break
+                        
                     img_path = os.path.join(patient_folder, slice_file)
-                    img_rgb = Image.open(img_path).convert('RGB')
-                    volume_tensor[i] = transform(img_rgb)
+                    
+                    # Uodparniamy przed wyciekiem pamięci przy użyciu context managera
+                    with Image.open(img_path) as img:
+                        img_rgb = img.convert('RGB')
+                        
+                    # Dodanie .copy() naprawia problem z ujemnym krokiem w numpy array przy konwersji RGB -> BGR
+                    img_bgr_array = np.array(img_rgb)[:, :, ::-1].copy()
+                    img_bgr = Image.fromarray(img_bgr_array)
+                    
+                    volume_tensor[i] = transform(img_bgr)
                         
                 vol_input = volume_tensor.unsqueeze(0).to(device)
 
@@ -1751,9 +1868,21 @@ def load_trained_efficientnet_predictions(X_test, dataset_path='Data/dataset_eff
 
                 volume_tensor = torch.zeros((30, 3, 224, 224))
                 for i, slice_file in enumerate(slices):
+                    # Zabezpieczenie przed wyjściem poza rozmiar tensora
+                    if i >= len(volume_tensor): 
+                        break
+                        
                     img_path = os.path.join(patient_folder, slice_file)
-                    img = Image.open(img_path).convert('RGB')
-                    volume_tensor[i] = transform(img)
+                    
+                    # Blok 'with' gwarantuje zwolnienie uchwytu do pliku po wczytaniu
+                    with Image.open(img_path) as img:
+                        img_rgb = img.convert('RGB')
+                        
+                    # .copy() alokuje nową pamięć, rozwiązując problem niekompatybilności z PyTorch
+                    img_bgr_array = np.array(img_rgb)[:, :, ::-1].copy()
+                    img_bgr = Image.fromarray(img_bgr_array)
+                    
+                    volume_tensor[i] = transform(img_bgr)
                     
                 vol_input = volume_tensor.unsqueeze(0).to(device)
                 
@@ -1839,15 +1968,20 @@ def load_trained_densenet_predictions(X_test, dataset_path='Data/dataset_ct_main
                     img_path = os.path.join(patient_folder, slice_file)
                     
                     if img_path.endswith('.dcm'):
-                        dicom_data = pydicom.dcmread(img_path)
+                        # Użycie bloku with zapewnia zwolnienie uchwytu pliku, co jest krytyczne w pętlach
+                        with open(img_path, 'rb') as f:
+                            dicom_data = pydicom.dcmread(f)
+                            
                         img_array = dicom_data.pixel_array.astype(np.float32)
                         intercept = float(getattr(dicom_data, 'RescaleIntercept', 0.0))
                         slope = float(getattr(dicom_data, 'RescaleSlope', 1.0))
                         hu_image = img_array * slope + intercept
                         img_pil = bone_window(hu_image)
                     else:
-                        img_array = np.array(Image.open(img_path).convert('L'))
-                        img_pil = bone_window(img_array)
+                        # Menedżer kontekstu, żeby nie wyciekały uchwyty plików przy dużej liczbie obrazów
+                        with Image.open(img_path) as img:
+                            # .copy() wymusza wczytanie do pamięci i odcina referencję od zamykanego pliku
+                            img_pil = img.convert('L').copy()
                     
                     tensor_2d = transform(img_pil)
                     volume_tensor[0, i] = tensor_2d.squeeze(0)
@@ -2321,7 +2455,11 @@ def train_pipeline(X_train, X_test, y_train, y_test):
         sampler=TPESampler(seed=SETTINGS.seed),
         pruner=MedianPruner()
     )
-    ensemble_study.optimize(bound_objective, n_trials=CONFIG.get("N_OPTUNA_TRIALS", 15))
+    ensemble_study.optimize(
+        bound_objective,
+        n_trials=CONFIG.get("N_OPTUNA_TRIALS", 15),
+        show_progress_bar=True
+        )
 
     bp = ensemble_study.best_params
     best_ensemble_type = bp.get('ensemble_type', 'full_stack')
@@ -2503,10 +2641,15 @@ def train_pipeline(X_train, X_test, y_train, y_test):
         densenet_for_judge
     ))
     base_names_meta = ['Konsylium', 'Eksperci', 'CRNN', 'EfficientNet', 'DenseNet']
+    
+    # Pakujemy macierz w DataFrame, by wszystkie algorytmy zachowały świadomość nazw 
+    X_meta_train_df = pd.DataFrame(X_meta_train, columns=base_names_meta)
 
     judge_lr = make_pipeline(PolynomialFeatures(degree=2, interaction_only=True, include_bias=False),
                              LogisticRegressionCV(Cs=[1e-3, 1e-2, 1e-1, 1, 10], scoring='roc_auc', class_weight='balanced', cv=3, random_state=CONFIG["SEED"], solver='lbfgs', max_iter=1000))
-    ebm_base = ExplainableBoostingClassifier(random_state=CONFIG["SEED"])
+    
+    # Wstrzyknięcie zdefiniowanych feature_names do instancji EBM
+    ebm_base = ExplainableBoostingClassifier(feature_names=base_names_meta, random_state=CONFIG["SEED"])
     judge_ebm = GridSearchCV(estimator=ebm_base, param_grid={'interactions': [2, 3, 4], 'learning_rate': [0.01, 0.05]}, scoring='roc_auc', cv=3, n_jobs=-1)
 
     final_judge = VotingClassifier(estimators=[('Logit_Poly', judge_lr), ('EBM', judge_ebm)], voting='soft')
@@ -2538,9 +2681,10 @@ def train_pipeline(X_train, X_test, y_train, y_test):
     real_efficientnet_test_probs, real_efficientnet_test_uncert = load_trained_efficientnet_predictions(X_test, dataset_path=os.path.join(BASE_DIR, 'Data', 'dataset_efficientnet'), device=device)
     real_densenet_test = load_trained_densenet_predictions(X_test, dataset_path=os.path.join(BASE_DIR, 'Data', 'dataset_ct_main'), device=device)
     
-    calibrated_final_judge = CalibratedClassifierCV(final_judge, method='isotonic', cv='prefit')
+    # Stosujemy wbudowane CV, aby kalibrator nie uczył się na danych treningowych sędziego
+    calibrated_final_judge = CalibratedClassifierCV(final_judge, method='isotonic', cv=3)
     
-    # Kalibrator również musi uwzględnić wagi próbek, by zachować poprawność probabilistyczną
+    # Kalibrator samodzielnie zarządza podziałem CV i uczy Sędziego na foldach
     calibrated_final_judge.fit(X_meta_train, y_train, sample_weight=sample_weights)
 
     # Ewaluację na zbiorze treningowym przepuszczamy przez oryginalne X_meta_train i y_train
@@ -4512,7 +4656,7 @@ def extract_mimic_timeseries_3d(filepath, item_ids, admittimes_dict, max_hours=2
     chunk_iterator = pd.read_csv(filepath, compression='gzip', chunksize=2000000, 
                                  usecols=['hadm_id', 'itemid', 'charttime', 'valuenum'], parse_dates=['charttime'])
     
-    for chunk in tqdm(chunk_iterator, desc="Ekstrakcja sekwencji z 30 GB chartevents", file=sys.stdout, leave=False):
+    for chunk in tqdm(chunk_iterator, desc="Ekstrakcja sekwencji z 30 GB chartevents", leave=False):
         filtered = chunk[chunk['itemid'].isin(flat_item_ids)].copy()
         if filtered.empty:
             continue
@@ -4832,7 +4976,7 @@ def fine_tune_holistic(X_train_df, y_train, artifacts, time_series_dict, main_ep
                 scaler.update()
                 optimizer.zero_grad(set_to_none=True)
                 
-        logger.info(f"GMM Hard Mining [{epoch+1}/{hard_mining_epochs}] | Strata: {running_loss/max(1, len(severe_indices)):.4f}")
+        logger.info(f"GMM Hard Mining Epoka [{epoch+1}/{hard_mining_epochs}] | Strata: {running_loss/max(1, len(severe_indices)):.4f}")
 
     save_path = 'output_data/Models/holistic_cascade_e2e.pth'
     torch.save(holistic_model.state_dict(), save_path)
@@ -5285,7 +5429,6 @@ def run_local_hospital_finetuning(calibrated_spec_pipe, artifacts, X_test, y_tes
     X_local_clean = X_test.sample(local_size, random_state=CONFIG.get("SEED", 42))
     y_local = y_test.loc[X_local_clean.index]
     
-    # Klonujemy logikę z HospitalShadowModeMock, by zniekształcić dane
     X_local_noisy = X_local_clean.copy()
     if 'sysbp_min' in X_local_noisy.columns:
         X_local_noisy['sysbp_min'] = X_local_noisy['sysbp_min'] * np.random.uniform(0.85, 0.90) - 5.0
@@ -5293,69 +5436,86 @@ def run_local_hospital_finetuning(calibrated_spec_pipe, artifacts, X_test, y_tes
         mask = np.random.rand(len(X_local_noisy)) < 0.10
         X_local_noisy.loc[mask, 'heart_rate_max'] = np.random.uniform(190.0, 220.0, size=mask.sum())
 
-    # Weryfikacja spadku metryk spowodowanego nowym środowiskiem
-    logger.info("Ocena modelu globalnego na danych z nowego szpitala:")
+    # Podział lokalnych danych na zbiór do Fine Tuningu i Walidacji
+    X_tune, X_val, y_tune, y_val = train_test_split(
+        X_local_noisy, y_local, test_size=0.3, stratify=y_local, random_state=CONFIG.get("SEED", 42)
+    )
 
-    # Generujemy fałszywy szum dla CV na potrzeby testu
-    crnn_p = np.clip(np.random.normal(0.5, 0.2, local_size), 0, 1)
-    caps_p = np.clip(np.random.normal(0.5, 0.2, local_size), 0, 1)
-    dense_p = np.clip(np.random.normal(0.5, 0.2, local_size), 0, 1)
-    efficientnet_p = np.clip(np.random.normal(0.5, 0.2, local_size), 0, 1)
+    logger.info("Ocena modelu globalnego na nowym sprzęcie (przed douczeniem):")
+
+    # Generowanie predykcji CV dla zbioru walidacyjnego
+    val_size = len(X_val)
+    crnn_p_val = np.clip(np.random.normal(0.5, 0.2, val_size), 0, 1)
+    caps_p_val = np.clip(np.random.normal(0.5, 0.2, val_size), 0, 1)
+    dense_p_val = np.clip(np.random.normal(0.5, 0.2, val_size), 0, 1)
+    efficientnet_p_val = np.clip(np.random.normal(0.5, 0.2, val_size), 0, 1)
 
     y_prob_before = calibrated_spec_pipe.predict_proba(
-        X_local_noisy, crnn_probs=crnn_p, efficientnet_probs=efficientnet_p, densenet_probs=dense_p
+        X_val, crnn_probs=crnn_p_val, efficientnet_probs=efficientnet_p_val, densenet_probs=dense_p_val
     )[:, 1]
     
-    auc_before = roc_auc_score(y_local, y_prob_before)
-    brier_before = brier_score_loss(y_local, y_prob_before)
+    auc_before = roc_auc_score(y_val, y_prob_before)
+    brier_before = brier_score_loss(y_val, y_prob_before)
     logger.info(f" AUROC: {auc_before:.4f} | Brier Score: {brier_before:.4f} (Widoczny spadek precyzji)")
 
-    # Zbieranie meta cech dla lokalnych pacjentów (Zamrożone modele bazowe)
-    logger.info("Zamrażam modele bazowe (CV + Drzewa). Ekstrakcja wektorów wiedzy dla Sędziego.")
+    logger.info("Zamrażam modele bazowe (CV + Drzewa). Ekstrakcja wektorów wiedzy dla Sędziego na zbiorze tuningowym.")
     
-    # Przechodzimy przez preprocessing i modele bazowe
-    X_noisy_transformed = calibrated_spec_pipe.preprocessor.transform(X_local_noisy)
+    # Przetwarzanie tylko zbioru tuningowego
+    X_tune_transformed = calibrated_spec_pipe.preprocessor.transform(X_tune)
     feature_names_out = [name.split('__')[-1] for name in calibrated_spec_pipe.preprocessor.get_feature_names_out()]
-    X_noisy_df = pd.DataFrame(X_noisy_transformed, columns=feature_names_out, index=X_local_noisy.index)
+    X_tune_df = pd.DataFrame(X_tune_transformed, columns=feature_names_out, index=X_tune.index)
     
-    prob_main = artifacts["ensemble_best"].predict_proba(X_noisy_df.values)[:, 1]
+    prob_main_tune = artifacts["ensemble_best"].predict_proba(X_tune_df.values)[:, 1]
     
-    # Symulacja decyzji Ekspertów
-    X_spec_local = X_local_noisy.copy()
-    if 'model_1_prob' not in X_spec_local.columns:
-        X_spec_local['model_1_prob'] = prob_main
+    X_spec_tune = X_tune.copy()
+    if 'model_1_prob' not in X_spec_tune.columns:
+        X_spec_tune['model_1_prob'] = prob_main_tune
     
-    available_spec = [f for f in artifacts["calibrated_spec"].estimator.prep.feature_names_in_ if f in X_spec_local.columns]
-    prob_spec = artifacts["calibrated_spec"].predict_proba(X_spec_local[available_spec])[:, 1]
+    available_spec = [f for f in artifacts["calibrated_spec"].estimator.prep.feature_names_in_ if f in X_spec_tune.columns]
+    prob_spec_tune = artifacts["calibrated_spec"].predict_proba(X_spec_tune[available_spec])[:, 1]
     
-    # Budowa nowej macierzy dla Sędziego
-    X_meta_local = np.column_stack((prob_main, prob_spec, crnn_p, caps_p, dense_p))
+    tune_size = len(X_tune)
+    crnn_p_tune = np.clip(np.random.normal(0.5, 0.2, tune_size), 0, 1)
+    caps_p_tune = np.clip(np.random.normal(0.5, 0.2, tune_size), 0, 1)
+    dense_p_tune = np.clip(np.random.normal(0.5, 0.2, tune_size), 0, 1)
+
+    X_meta_tune = np.column_stack((prob_main_tune, prob_spec_tune, crnn_p_tune, caps_p_tune, dense_p_tune))
+    base_names_meta = ['Konsylium', 'Eksperci', 'CRNN', 'EfficientNet', 'DenseNet']
+    X_meta_tune_df = pd.DataFrame(X_meta_tune, columns=base_names_meta)
     
-    # Retrening Meta Sędziego
-    logger.info("Adaptacja Domeny: Douczanie ostatecznego Meta-Sędziego na lokalnych danych z OIT.")
+    logger.info("Adaptacja Domeny: Douczanie ostatecznego Meta Sędziego na lokalnych danych z OIT.")
     
-    # Pobieramy oryginalnego Sędziego i douczamy go na nowej, lokalnej dystrybucji danych
     local_judge = clone(artifacts["final_judge"])
     
-    # Cost sensitive learning dla lokalnego szpitala
-    sample_weights = np.ones(len(y_local))
-    sample_weights[(y_local == 1) & (prob_main < 0.3)] = 5.0 # Kara za przeoczone zgony w nowym szpitalu
+    sample_weights = np.ones(len(y_tune))
+    sample_weights[(y_tune == 1) & (prob_main_tune < 0.3)] = 5.0 
     
-    local_judge.fit(X_meta_local, y_local, sample_weight=sample_weights)
+    # Używamy cv=3 dla kalibratora, chroniąc go przed wyciekiem na zbiorze tuningowym
+    calibrated_local_judge = CalibratedClassifierCV(local_judge, method='isotonic', cv=3)
+    calibrated_local_judge.fit(X_meta_tune_df, y_tune, sample_weight=sample_weights)
     
-    # Ponowna kalibracja probabilistyczna na lokalne warunki
-    calibrated_local_judge = CalibratedClassifierCV(local_judge, method='isotonic', cv='prefit')
-    calibrated_local_judge.fit(X_meta_local, y_local, sample_weight=sample_weights)
-    
-    # Podmiana Sędziego w głównym potoku
     calibrated_spec_pipe.judge = calibrated_local_judge
 
-    # Ewaluacja po douczeniu
-    logger.info("Ocena modelu po lokalnej adaptacji (PO DOUCZENIU):")
-    y_prob_after = calibrated_local_judge.predict_proba(X_meta_local)[:, 1]
+    logger.info("Ocena modelu po lokalnej adaptacji (Na CZYSTYM zbiorze walidacyjnym):")
     
-    auc_after = roc_auc_score(y_local, y_prob_after)
-    brier_after = brier_score_loss(y_local, y_prob_after)
+    # Przetwarzanie zbioru walidacyjnego do postaci meta
+    X_val_transformed = calibrated_spec_pipe.preprocessor.transform(X_val)
+    X_val_df = pd.DataFrame(X_val_transformed, columns=feature_names_out, index=X_val.index)
+    prob_main_val = artifacts["ensemble_best"].predict_proba(X_val_df.values)[:, 1]
+    
+    X_spec_val = X_val.copy()
+    if 'model_1_prob' not in X_spec_val.columns:
+        X_spec_val['model_1_prob'] = prob_main_val
+        
+    prob_spec_val = artifacts["calibrated_spec"].predict_proba(X_spec_val[available_spec])[:, 1]
+    
+    X_meta_val = np.column_stack((prob_main_val, prob_spec_val, crnn_p_val, caps_p_val, dense_p_val))
+    X_meta_val_df = pd.DataFrame(X_meta_val, columns=base_names_meta)
+
+    y_prob_after = calibrated_local_judge.predict_proba(X_meta_val_df)[:, 1]
+    
+    auc_after = roc_auc_score(y_val, y_prob_after)
+    brier_after = brier_score_loss(y_val, y_prob_after)
     
     logger.info(f"AUROC: {auc_after:.4f} (Poprawa o {auc_after - auc_before:+.4f})")
     logger.info(f"Brier Score: {brier_after:.4f} (Mniejszy = Lepsza Kalibracja)")
@@ -5405,6 +5565,7 @@ class ClinicalDataDriftMonitor:
 
     def _calculate_psi(self, expected: np.ndarray, actual: np.ndarray, num_bins: int = 10) -> float:
         """ Oblicza Population Stability Index (PSI) dla zmiennej ciągłej. """
+
         # Tworzymy kubełki na podstawie rozkładu referencyjnego (treningowego)
         percentiles = np.linspace(0, 100, num_bins + 1)
         bin_edges = np.percentile(expected, percentiles)
@@ -5650,11 +5811,16 @@ if __name__ == "__main__":
         - Trigger Szarej Strefy: Jeśli prawdopodobieństwo kryzysu wyliczone w Etapie 1 mieści się w strefie brzegowej,
           system wie, że twarde reguły drzew są w tym punkcie zawodne. W przypadku aktywacji któregokolwiek z tych warunków,
           system uruchamia turniej zróżnicowanych algorytmów zoptymalizowanych przez HalvingGridSearch:
-        1. HistGradientExpert: Szybki i odporny ekspert oparty na gradient boostingu drzew.
+        1. HistGradientExpert: Szybki i wysoce odporny model oparty na histogramowym gradiencie boostingu. Obecność algorytmu
+            drzewiastego w drugiej faziep to celowy zabieg mający na celu wymuszenie różnorodności błędów w zespole ekspertów.
+            Model ten różni się od standardowych drzew z pierwszej fazy tym, że przed procesem uczenia dyskretyzuje cechy ciągłe
+            do postaci ustandaryzowanych histogramów. Taki mechanizm drastycznie zmienia topologię wyszukiwania optymalnych podziałów.
+            Dzięki temu model przetwarza złożone zależności skutecznie identyfikując ukryte, nieliniowe sygnały ostrzegawcze o pogorszeniu
+            stanu pacjenta. Wprowadza do finałowego etapu świeże spojrzenie, oparte na innym typie analizy danych.
         2. NonLinearSVM: Ekspert od nieliniowych, geometrycznych granic wokół wektorów nośnych na krawędzi przeżycia.
         3. NonLinearMLP: Głęboka sieć neuronowa optymalizowana algorytmem HalvingGridSearch do wyłapania złożonych, ukrytych nieliniowości.
-        4. ClinicalProfileExpert: Zespół głosujący (Voting Classifier) łączący Regresję Logistyczną i KNN,
-           zapewniający stabilizację prawdopodobieństw i ocenę fizjologicznego podobieństwa.
+        4. ClinicalProfileExpert: Zespół głosujący łączący Regresję Logistyczną i KNN, zapewniający stabilizację prawdopodobieństw
+            i ocenę fizjologicznego podobieństwa, dla dopełnienia analizy zwykłą metodą podobieństwa.
         Całość spina PhenotypeTournamentRouter, który dynamicznie routuje pacjentów do najlepszych ekspertów w oparciu o ich fenotypy.
 
     ETAP 3: Fuzja Multimodalna i Ostateczny Sędzia
@@ -5699,11 +5865,17 @@ if __name__ == "__main__":
         dotrenowanie modelu na ekstremalnie rzadkich przypadkach przedagonalnych.
     
     CEL NADRZĘDNY SYSTEMU: Przełamywanie nihilizmu i zasada realnej pomocy
-    Odrzucenie metrykowego narcyzmu: Głównym celem systemu nie jest sztuczne pompowanie statystyk, wyśrubowywanie wskaźników AUC
-    w warunkach laboratoryjnych czy optymalizowanie papierowych tabel, lecz realna, mierzalna pomoc człowiekowi na krawędzi życia i śmierci.
-    Zasada 3 miesięcy: Horyzont czasowy decyzyjności nie kończy się na wypisie z OIT – system projektowano z myślą o perspektywie długofalowej,
-    gdzie faktycznym miarą sukcesu jest jakość powrotu pacjenta do sprawności neurologicznej i samodzielności.
-    Nowy paradygmat medyczny: Architektura porzuca zimną kalkulację opłacalności, kosztów leczenia czy ekonomicznej efektywności na rzecz
-    fundamentalnego pytania klinicznego: jaka forma pomocy i interwencji jest w tym konkretnym ułamku sekundy najlepsza dla tego chorego.
-    Walka z nihilizmem terapeutycznym: Wobec gigantycznej, przytłaczającej złożoności ludzkiego mózgu, która często rodzi w medycynie poczucie
-    bezradności, system ma być tarczą przeciwko rezygnacji – dając lekarzowi precyzyjne oparcie tam, gdzie standardowe procedury i ludzkie zmysły ulegają wyczerpaniu."""
+        Zasada 3 miesięcy: Horyzont czasowy decyzyjności nie kończy się na wypisie z OIT – system projektowano z myślą o perspektywie długofalowej, 
+        gdzie faktycznym miarą sukcesu jest jakość powrotu pacjenta do sprawności neurologicznej i samodzielności.
+        Przeniesienie paradygmatu: Architektura porzuca zimną kalkulację opłacalności i kosztów leczenia, bezpowrotnie zmieniając wektor decyzji. 
+        System eliminuje z przestrzeni klinicznej fatalistyczne pytanie „czy warto jeszcze pomagać?”, zastępując je zorientowanym na działanie imperatywem: 
+        „w jaki sposób możemy pomóc tu i teraz?”. Zamiast szukać ekonomicznego uzasadnienia, algorytm skupia się na zidentyfikowaniu interwencji, 
+        która w danym ułamku sekundy jest najlepsza dla tego konkretnego chorego.
+        Walka z nihilizmem terapeutycznym: Wobec gigantycznej, przytłaczającej złożoności ludzkiego mózgu, która często rodzi w medycynie poczucie bezradności, 
+        system ma być tarczą przeciwko rezygnacji – dając lekarzowi precyzyjne oparcie tam, gdzie standardowe procedury i ludzkie zmysły ulegają wyczerpaniu.
+        Świadomość asymetrii błędu: W neurointensywnej terapii konsekwencje bierności lub opóźnionej decyzji są nieporównywalnie bardziej katastrofalne niż 
+        koszty nadmiarowej ostrożności. System został zaprogramowany z rygorystycznym uwzględnieniem tej asymetrii – w warunkach drastycznej niepewności 
+        i szumu informacyjnego, algorytm ma obowiązek bezwzględnie faworyzować kierunek chroniący potencjał przetrwania. Lepiej wywołać fałszywy alarm 
+        inicjujący interwencję, niż stracić bezpowrotnie to wąskie okno terapeutyczne, w którym na zawsze decydują się losy układu nerwowego. 
+        W miarę dodawania kolejnych modalności i źródeł danych, system staje się coraz bardziej odporny na szum i niepewność, a jego decyzje coraz
+        bardziej trafne i spójne z biologiczną rzeczywistością pacjenta, chroniąc przed zalewem fałszywych alarmów. """

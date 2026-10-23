@@ -4,7 +4,6 @@ import sys
 import gc
 import math
 import json
-from xml.parsers.expat import model
 import zipfile
 import logging
 from collections import defaultdict
@@ -70,12 +69,30 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # Inicjalizacja systemu logowania
-logging.basicConfig(
-    level=logging.INFO,
-    format='[%(asctime)s] %(levelname)s\n%(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
-)
-logger = logging.getLogger(__name__)
+def setup_logger(name="CRNN", level=logging.INFO):
+    class _TqdmStream:
+        def write(self, buf):
+            tqdm.write(buf, end="")
+
+        def flush(self):
+            pass
+
+    logger = logging.getLogger(name)
+    logger.setLevel(level)
+
+    # Używamy instancji _TqdmStream(), żeby logi nie kolidowały z paskiem postępu tqdm
+    handler = logging.StreamHandler(stream=_TqdmStream())
+    handler.setFormatter(
+        logging.Formatter("[%(asctime)s] %(levelname)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+    )
+
+    if not logger.handlers:
+        logger.addHandler(handler)
+
+    return logger
+
+logger = setup_logger()
+
 
 # Ustawienie liczby wątków dla DataLoaderów i operacji macierzowych na GPU
 NUM_WORKERS = 4
@@ -433,17 +450,23 @@ class VolumetricMedicalResNetCRNN(nn.Module):
         Regresja przesunięcia linii środkowej w milimetrach dla konkretnych, wykrytych przypadków patologicznych
         stanowiłaby cenne rozszerzenie ilościowe, jednak pozyskanie precyzyjnych wymiarów przestrzennych przekracza
         obecne możliwości projektu, dlatego zadanie to zostało odłożone jako kierunek przyszłego rozwoju."""
-    def __init__(self, hidden_dim=256, num_layers=2, dropout=0.3, task='regression', num_classes=4, use_checkpointing=True):
+    def __init__(self, hidden_dim=256, num_layers=2, dropout=0.3, task='classification', num_classes=4, use_checkpointing=True, base_dir="."):
         super(VolumetricMedicalResNetCRNN, self).__init__()
         self.use_checkpointing = use_checkpointing
         
-        weights_path = hf_hub_download(
-            repo_id="TencentMedicalNet/MedicalNet-Resnet50", 
-            filename="resnet_50_23dataset.pth",
-            local_dir=os.path.join(BASE_DIR, "output_data", "Models"),
-            token=os.getenv("HF_TOKEN")
-        )
+        # Wyeliminowano niezdefiniowaną zmienną globalną BASE_DIR na rzecz argumentu base_dir
+        models_dir = os.path.join(base_dir, "output_data", "Models")
+        weights_path = os.path.join(models_dir, "resnet_50_23dataset.pth")
+        weights_url = "https://huggingface.co/TencentMedicalNet/MedicalNet-Resnet50/resolve/main/resnet_50_23dataset.pth"
         
+        # Logika automatycznego pobierania pliku, jeśli nie istnieje na dysku
+        if not os.path.exists(weights_path):
+            import urllib.request
+            print(f"Brak pliku wag w {weights_path}. Rozpoczynam pobieranie.")
+            os.makedirs(models_dir, exist_ok=True)
+            urllib.request.urlretrieve(weights_url, weights_path)
+            print("Pobieranie wag zakończone.")
+
         base_resnet = models.resnet50(weights=None)
         
         # Bezpieczne ładowanie wag z obsługą różnych formatów słowników
@@ -460,7 +483,7 @@ class VolumetricMedicalResNetCRNN(nn.Module):
             if 'fc' in k_clean or 'classifier' in k_clean:
                 continue
                 
-            # Konwersja kerneli 3D (5D tensor) na 2D (4D tensor) przez wzięcie środkowego przekroju
+            # Konwersja kerneli 3D na 2D przez wzięcie środkowego przekroju
             if v.dim() == 5:
                 v_2d = v[:, :, v.size(2) // 2, :, :]
             else:
@@ -523,6 +546,7 @@ class VolumetricMedicalResNetCRNN(nn.Module):
             input_size=hidden_dim, hidden_size=hidden_dim, num_layers=num_layers
         )
 
+        # Inicjalizacja odpowiedniej warstwy wyjściowej z zachowaniem możliwości przełączenia na regresję w przyszłości
         out_dim = 1 if task == 'regression' else num_classes
         self.fc = nn.Sequential(
             nn.Linear(hidden_dim * 2, 64),
@@ -542,7 +566,8 @@ class VolumetricMedicalResNetCRNN(nn.Module):
         x_reshaped = x.view(batch_size * num_slices, C, H, W)
         
         # Gradient Checkpointing pozwala zaoszczędzić do 50% VRAM kosztem minimalnego narzutu obliczeniowego
-        if self.use_checkpointing and x_reshaped.requires_grad:
+        if self.use_checkpointing and self.training:
+            x_reshaped.requires_grad_() # Wymuszenie śledzenia niezbędnego dla checkpointingu
             features = checkpoint(self._forward_slice, x_reshaped, use_reentrant=False)
         else:
             features = self._forward_slice(x_reshaped)
@@ -645,7 +670,7 @@ def prepare_rsna_data(zip_path: str, csv_path: str, output_dir: str, patients_li
             with z.open(dcm_file) as f:
                 try:
                     dicom_data = pydicom.dcmread(f, stop_before_pixels=False)
-                    patient_id = str(getattr(dicom_data, 'index', 'Unknown'))
+                    patient_id = str(getattr(dicom_data, 'PatientID', getattr(dicom_data, 'StudyInstanceUID', 'Unknown')))
                     
                     if patient_id not in current_patients:
                         if len(current_patients) >= patients_limit:
@@ -747,12 +772,13 @@ class TargetedCenterErasing(nn.Module):
 
 class CTSliceDataset(Dataset):
     """ Ładuje wolumeny CT pacjenta i paruje je z etykietami (klasyfikacja lub regresja mm). """
-    def __init__(self, root_dir, num_slices=24, img_size=160, is_train=True, light_aug=False):
+    def __init__(self, root_dir, num_slices=24, img_size=160, is_train=True, light_aug=False, task='classification'):
         self.root_dir = root_dir
         self.num_slices = num_slices
         self.is_train = is_train
         self.light_aug = light_aug
         self.img_size = img_size
+        self.task = task
         
         labels_path = os.path.join(root_dir, 'labels.csv')
         self.img_dir = os.path.join(root_dir, 'images')
@@ -763,13 +789,11 @@ class CTSliceDataset(Dataset):
         self.labels_df = pd.read_csv(labels_path)
         self.labels_df.columns = self.labels_df.columns.str.strip()
 
-        # Uniwersalna obsługa ID (RSNA ma 'index', CQ500 ma 'name')
         if 'name' in self.labels_df.columns and 'PatientID' not in self.labels_df.columns:
             self.labels_df = self.labels_df.rename(columns={'name': 'PatientID'})
         elif 'index' in self.labels_df.columns and 'PatientID' not in self.labels_df.columns:
             self.labels_df = self.labels_df.rename(columns={'index': 'PatientID'})
             
-        # Mapowanie skrótów klinicznych z CQ500 do standardu RSNA
         cq500_to_rsna = {
             'EDH': 'epidural',
             'SDH': 'subdural',
@@ -779,18 +803,16 @@ class CTSliceDataset(Dataset):
         }
         self.labels_df = self.labels_df.rename(columns=cq500_to_rsna)
 
-        # Generowanie ścieżek
         self.patient_folders = [os.path.join(self.img_dir, str(pid)) for pid in self.labels_df['PatientID']]
         
-        # Automatyczne rozpoznanie zadania: regresja (midline_shift w mm) lub klasyfikacja (5 klas)
-        if 'midline_shift' in self.labels_df.columns:
+        # Powiązanie trybu regresji z jawnym argumentem 'task'
+        if self.task == 'regression' and 'midline_shift' in self.labels_df.columns:
             self.is_regression = True
             self.labels = self.labels_df['midline_shift'].values.astype(np.float32)
         else:
             self.is_regression = False
             self.labels = self.labels_df[['epidural', 'subdural', 'subarachnoid', 'intraparenchymal', 'intraventricular']].values.astype(np.float32)
 
-        # Inicjalizacja transformacji przez fabrykę
         self.transform = self._get_transforms(budget=1.0 if self.is_train else 0.0)
 
     def _get_base_normalization(self):
@@ -845,10 +867,20 @@ class CTSliceDataset(Dataset):
 
     def __getitem__(self, idx):
         try:
+            import re  # Wymagane do parsowania liczb w nazwach plików
             patient_path = self.patient_folders[idx]
             label_val = self.labels[idx]
             
-            slices = sorted([f for f in os.listdir(patient_path) if f.endswith(('.png', '.jpg'))])
+            # Klucz do naturalnego sortowania (numerycznego)
+            def natural_sort_key(s):
+                return [int(text) if text.isdigit() else text.lower() for text in re.split(r'(\d+)', s)]
+            
+            # Zastosowanie naturalnego sortowania zamiast alfabetycznego
+            slices = sorted(
+                [f for f in os.listdir(patient_path) if f.endswith(('.png', '.jpg'))], 
+                key=natural_sort_key
+            )
+            
             if not slices:
                 raise ValueError(f"Brak obrazów w folderze {patient_path}")
                 
@@ -863,7 +895,7 @@ class CTSliceDataset(Dataset):
             volumetric_seed = int(torch.randint(0, 2**32, (1,)).item())
             rng_state = torch.get_rng_state()
             
-            loaded_images = [np.array(Image.open(os.path.join(patient_path, s)).convert('RGB')) for s in slices]
+            loaded_images = [np.array(Image.open(os.path.join(patient_path, s)).convert('RGB'))[:, :, ::-1] for s in slices]
             
             for i in range(len(slices)):
                 img_curr = loaded_images[i]
@@ -888,59 +920,25 @@ class CTSliceDataset(Dataset):
     
     
 class MultiLabelFocalLoss(nn.Module):
-    """ W przypadkach medycznych model musi częściej generować fałszywe alarmy, żeby nie przeoczyć chorego
-        pacjenta. Mechanizm rozdziela kary:
-        - gamma_pos: Niskie wyciszanie dla chorych. Sieć chłonie każdy sygnał patologii.
-        - gamma_neg: Tłumienie dla zdrowych przypadków, by nie zdominowały gradientu.
-        - alpha: Wektor dostosowujący czułość do unikalnej rzadkości każdego z 5 krwotoków z osobna. 
-        - pos_weight: Twardy mnożnik błędu dla klasy pozytywnej. Brutalnie wymusza na sieci zauważanie 
-          chorych pacjentów zanim zadziała mechanizm Focal. """
-    def __init__(self, alpha=None, gamma_pos=1.0, gamma_neg=2.0, pos_weight=None, reduction='mean'):
-        super(MultiLabelFocalLoss, self).__init__()
-        self.alpha = alpha
+    """ Zrównoważony Focal Loss z umiarkowaną preferencją klasy dodatniej. Zachowuje zdolność dyskryminacji
+        i właściwą kalibrację prawdopodobieństw dla ostatecznego sędziego. """
+    def __init__(self, gamma_pos=2.0, gamma_neg=2.0, alpha_pos=1.5):
+        super().__init__()
         self.gamma_pos = gamma_pos
         self.gamma_neg = gamma_neg
-        self.pos_weight = pos_weight  
-        self.reduction = reduction
+        self.alpha_pos = alpha_pos  # Umiarkowane zwiększenie wagi czułości
 
-    def forward(self, inputs, targets) -> torch.Tensor:
-        # Dynamiczne przeniesienie wag na urządzenie GPU/CPU
-        pw = self.pos_weight.to(inputs.device) if self.pos_weight is not None else None
+    def forward(self, logits, targets):
+        probs = torch.sigmoid(logits)
         
-        # Konwersja wyników modelu na prawdopodobieństwa
-        probs = torch.sigmoid(inputs)
+        # Stonowana kara za pominięcie dodatniego przypadku
+        pos_loss = -self.alpha_pos * ((1.0 - probs) ** self.gamma_pos) * torch.log(probs + 1e-7) * targets
         
-        # Obliczenie bazowej straty z bezpiecznym pos_weight
-        bce_loss = func.binary_cross_entropy_with_logits(
-            inputs, 
-            targets, 
-            pos_weight=pw, 
-            reduction='none'
-        )
+        # Symetryczna kara dla przypadków ujemnych dla zachowania właściwego rozkładu prawdopodobieństwa
+        neg_loss = -((probs) ** self.gamma_neg) * torch.log(1.0 - probs + 1e-7) * (1.0 - targets)
         
-        # Prawdopodobieństwo poprawnej predykcji
-        pt = probs * targets + (1 - probs) * (1 - targets)
-        
-        # Asymetryczna mapa Gamma (dla chorego niższa, zdrowego wyższa)
-        gamma_map = targets * self.gamma_pos + (1 - targets) * self.gamma_neg
-        
-        # Główny mechanizm wyciszania
-        focal_weight = (1 - pt) ** gamma_map
-        loss = focal_weight * bce_loss
-        
-        # Alpha przeniesiona na właściwe urządzenie
-        if self.alpha is not None:
-            alpha_tensor = self.alpha.to(inputs.device)
-            alpha_t = alpha_tensor * targets + (1 - alpha_tensor) * (1 - targets)
-            loss = loss * alpha_t
-            
-        # Ostateczna redukcja do jednej liczby
-        if self.reduction == 'mean':
-            return loss.mean()
-        elif self.reduction == 'sum':
-            return loss.sum()
-        else:
-            return loss
+        loss = pos_loss + neg_loss
+        return loss.mean()
 
 
 def optimize_crnn_thresholds(y_true_matrix, y_prob_matrix, sensitivity_weight=0.5):
@@ -1041,39 +1039,45 @@ def _train_epoch_crnn(
     dataloader: DataLoader, 
     optimizer: optim.Optimizer, 
     criterion: nn.Module, 
-    scaler: Any, # Docelowo torch.amp.GradScaler
+    scaler: Any,
     config: CRNNConfig,
     desc: str,
-    budget: Optional[float] = None
+    budget: Optional[float] = None,
+    disable: bool = False
 ) -> float:
     """ Zunifikowana pętla treningowa wspierająca Curriculum Learning. """
     model.train()
     if budget is not None:
-        dataloader.dataset.dataset.set_budget(budget)
+        # Bezpieczne odpakowanie zagnieżdżonego datasetu (Subset -> Dataset)
+        ds = dataloader.dataset
+        while hasattr(ds, 'dataset'):
+            ds = ds.dataset
+        if hasattr(ds, 'set_budget'):
+            ds.set_budget(budget)
         
     train_loss = 0.0
     optimizer.zero_grad(set_to_none=True) 
     
-    pbar = tqdm(dataloader, desc=desc, leave=False, mininterval=2.0)
-    for i, (volumes, labels, _) in enumerate(pbar):
-        volumes, labels = volumes.to(DEVICE, non_blocking=True), labels.to(DEVICE, non_blocking=True)
-        
-        autocast_context = torch.amp.autocast(device_type='cuda') if DEVICE.type == 'cuda' else nullcontext()
-        with autocast_context:
-            outputs = model(volumes)
-            loss = criterion(outputs, labels) / config.accumulation_steps
+    with tqdm(dataloader, desc=desc if desc else "Przetwarzanie batchy", leave=False, position=1, mininterval=2.0, dynamic_ncols=True, disable=disable) as pbar:
+        for i, (volumes, labels, _) in enumerate(pbar):
+            volumes, labels = volumes.to(DEVICE, non_blocking=True), labels.to(DEVICE, non_blocking=True)
             
-        scaler.scale(loss).backward()
-        
-        if (i + 1) % config.accumulation_steps == 0 or (i + 1) == len(dataloader):
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            scaler.step(optimizer)
-            scaler.update()
-            optimizer.zero_grad(set_to_none=True)
+            autocast_context = torch.amp.autocast(device_type='cuda') if DEVICE.type == 'cuda' else nullcontext()
+            with autocast_context:
+                outputs = model(volumes)
+                loss = criterion(outputs, labels) / config.accumulation_steps
+                
+            scaler.scale(loss).backward()
+            
+            if (i + 1) % config.accumulation_steps == 0 or (i + 1) == len(dataloader):
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
 
-        train_loss += loss.item() * config.accumulation_steps
-        pbar.set_postfix({'loss': f"{loss.item() * config.accumulation_steps:.4f}"})
+            train_loss += loss.item() * config.accumulation_steps
+            pbar.set_postfix({'loss': f"{loss.item() * config.accumulation_steps:.4f}"})
         
     return train_loss / len(dataloader)
 
@@ -1085,25 +1089,26 @@ def _validate_epoch_crnn(
     criterion: nn.Module, 
     desc: str,
     optimize_thresholds: bool = True,
-    sensitivity_weight: float = 0.5
+    sensitivity_weight: float = 0.5,
+    disable: bool = False
 ) -> Tuple[float, float, float, float, float, np.ndarray]:
     """ Ewaluacja epoki zwracająca stratę, AUC, Balanced Accuracy, Czułość, Specyficzność i Progi Decyzyjne. """
     model.eval()
     val_loss = 0.0
     all_targets, all_probs = [], []
     
-    pbar = tqdm(dataloader, desc=desc, leave=False, file=sys.stdout, mininterval=2.0)
-    for volumes, labels, _ in pbar:
-        volumes, labels = volumes.to(DEVICE, non_blocking=True), labels.to(DEVICE, non_blocking=True)
-        
-        autocast_context = torch.amp.autocast(device_type='cuda') if DEVICE.type == 'cuda' else nullcontext()
-        with autocast_context:
-            outputs = model(volumes)
-            loss = criterion(outputs, labels)
+    with tqdm(dataloader, desc=desc if desc else "Ewaluacja epoki", leave=False, position=1, mininterval=2.0, dynamic_ncols=True, disable=disable) as pbar:
+        for volumes, labels, _ in pbar:
+            volumes, labels = volumes.to(DEVICE, non_blocking=True), labels.to(DEVICE, non_blocking=True)
             
-        val_loss += loss.item()
-        all_targets.append(labels.cpu().numpy())
-        all_probs.append(torch.sigmoid(outputs).cpu().numpy())
+            autocast_context = torch.amp.autocast(device_type='cuda') if DEVICE.type == 'cuda' else nullcontext()
+            with autocast_context:
+                outputs = model(volumes)
+                loss = criterion(outputs, labels)
+                
+            val_loss += loss.item()
+            all_targets.append(labels.cpu().numpy())
+            all_probs.append(torch.sigmoid(outputs).cpu().numpy())
         
     val_loss /= len(dataloader)
     y_true = np.vstack(all_targets).astype(int)
@@ -1123,13 +1128,17 @@ def _validate_epoch_crnn(
         yt, yp = y_true[:, c], preds[:, c]
         try:
             tn, fp, fn, tp = confusion_matrix(yt, yp, labels=[0, 1]).ravel()
-            sensitivities.append((tp / (tp + fn) * 100) if (tp + fn) > 0 else 0.0)
-            specificities.append((tn / (tn + fp) * 100) if (tn + fp) > 0 else 0.0)
+
+            # Jeśli brak danego typu schorzenia, wstawiamy np.nan, żeby nie zafałszować średniej makro
+            sensitivities.append((tp / (tp + fn) * 100) if (tp + fn) > 0 else np.nan)
+            specificities.append((tn / (tn + fp) * 100) if (tn + fp) > 0 else np.nan)
         except ValueError:
             sensitivities.append(0.0)
             specificities.append(0.0)
-            
-    macro_sens, macro_spec = np.mean(sensitivities), np.mean(specificities)
+
+    # Ostatni wynik makro: średnia z klas, ignorując np.nan (brak danej klasy w zbiorze walidacyjnym)
+    macro_sens = np.nanmean(sensitivities) if not np.all(np.isnan(sensitivities)) else 0.0
+    macro_spec = np.nanmean(specificities) if not np.all(np.isnan(specificities)) else 0.0
     macro_bacc = (macro_sens + macro_spec) / 2.0
     auc = roc_auc_score(y_true, y_prob, average='macro') if len(np.unique(y_true)) > 1 else 0.5
         
@@ -1139,7 +1148,7 @@ def _validate_epoch_crnn(
 def train_crnn(custom_config: Optional[CRNNConfig] = None) -> None:
     """ Główna orkiestracja kaskadowego modelu CRNN w architekturze trójfazowej. """
     config = custom_config or CRNNConfig()
-    logger.info(f"Uruchamianie 3-fazowego treningu CRNN na urządzeniu: {DEVICE}")
+    logger.info(f"Uruchamianie trójfazowego treningu CRNN na urządzeniu: {DEVICE}")
 
     dataset_path_main = os.path.join(BASE_DIR, 'Data', 'dataset_ct_main')
     model_path_main = os.path.join(BASE_DIR, 'output_data', 'Models', 'crnn_main_diagnosis.pth')
@@ -1149,8 +1158,12 @@ def train_crnn(custom_config: Optional[CRNNConfig] = None) -> None:
     # Przygotowanie zbiorów danych i loaderów
     full_dataset = CTSliceDataset(root_dir=dataset_path_main, num_slices=config.num_slices, img_size=config.img_size, is_train=True)
     val_dataset = CTSliceDataset(root_dir=dataset_path_main, num_slices=config.num_slices, img_size=config.img_size, is_train=False)
-    
-    labels_binary = np.any(full_dataset.labels > 0, axis=1).astype(int)
+
+    # Zależnie od funkcji, tworzymy binarne etykiety do stratified split
+    if getattr(full_dataset, 'is_regression', False):
+        labels_binary = (full_dataset.labels > 0).astype(int)
+    else:
+        labels_binary = np.any(full_dataset.labels > 0, axis=1).astype(int)
     train_indices, val_indices = train_test_split(range(len(full_dataset)), test_size=0.2, stratify=labels_binary, random_state=42)
     
     train_sub = Subset(full_dataset, train_indices)
@@ -1176,12 +1189,23 @@ def train_crnn(custom_config: Optional[CRNNConfig] = None) -> None:
         # Przekazujemy do optymalizatora odblokowane wagi (LSTM, FC)
         optimizer_warmup = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=1e-4)
         criterion_warmup = MultiLabelFocalLoss(gamma_pos=2.0, gamma_neg=2.0)
-        
+
         for epoch in range(config.epochs_warmup):
-            model.backbone.eval() # Backbone musi być w trybie eval (zamrożony BatchNorm)
-            train_loss = _train_epoch_crnn(model, train_loader, optimizer_warmup, criterion_warmup, scaler, config, desc=f"Warmup [{epoch+1}/{config.epochs_warmup}]", budget=0.2)
-            val_loss, auc, bacc, sens, spec, _ = _validate_epoch_crnn(model, val_loader, criterion_warmup, desc=f"Val Warmup", optimize_thresholds=False)
-            logger.info(f"Warmup [{epoch+1}/{config.epochs_warmup}] | Train: {train_loss:.4f}, Val: {val_loss:.4f} | BAcc: {bacc:.1f}%")
+            model.backbone.eval()  # Backbone musi być w trybie eval (zamrożony BatchNorm)
+            
+            train_loss = _train_epoch_crnn(
+                model, train_loader, optimizer_warmup, criterion_warmup, scaler, config, 
+                desc=f"Warmup Epoka [{epoch+1}/{config.epochs_warmup}]", budget=0.2, disable=False
+            )
+            val_loss, auc, bacc, sens, spec, _ = _validate_epoch_crnn(
+                model, val_loader, criterion_warmup, 
+                desc="Walidacja Warmup", optimize_thresholds=False, disable=False
+            )
+            
+            logger.info(
+                f"Warmup Epoka [{epoch+1}/{config.epochs_warmup}] | "
+                f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | BAcc: {bacc:.1f}%"
+            )
 
         logger.info("FAZA 1: MAIN (Odblokowany cały model - Optymalizacja BAcc)")
         for param in model.parameters(): param.requires_grad = True # Odmrażamy wszystko
@@ -1193,19 +1217,35 @@ def train_crnn(custom_config: Optional[CRNNConfig] = None) -> None:
         best_val_bacc = 0.0
         patience_counter = 0
         
-        for epoch in range(config.epochs_main):
+        main_pbar = tqdm(range(config.epochs_main), desc="Main Phase", position=0, leave=True, dynamic_ncols=True)
+        for epoch in main_pbar:
             current_budget = get_dynamic_weight(epoch, config.epochs_main, start_w=0.4, end_w=1.0)
-            train_loss = _train_epoch_crnn(model, train_loader, optimizer_main, criterion_main, scaler, config, desc=f"Main [{epoch+1}/{config.epochs_main}]", budget=current_budget)  
-            val_loss, auc, bacc, sens, spec, thresholds = _validate_epoch_crnn(model, val_loader, criterion_main, desc=f"Val Main [{epoch+1}]", optimize_thresholds=True, sensitivity_weight=0.5)
+            
+            train_loss = _train_epoch_crnn(
+                model, train_loader, optimizer_main, criterion_main, scaler, config,
+                desc="Trening Main", budget=current_budget, disable=False
+            )  
+            val_loss, auc, bacc, sens, spec, thresholds = _validate_epoch_crnn(model, val_loader, criterion_main,
+                                                                               desc="Walidacja Main", optimize_thresholds=True,
+                                                                               sensitivity_weight=0.5, disable=False
+                                                                               )
             
             scheduler_main.step(bacc)
-            logger.info(f"Main [{epoch+1}/{config.epochs_main}] | Train {train_loss:.4f}, Val {val_loss:.4f} | AUC: {auc:.3f} | BAcc: {bacc:.1f}% | Sens: {sens:.1f}% | Spec: {spec:.1f}%")
+            
+            main_pbar.set_postfix({
+                'Train': f"{train_loss:.4f}", 
+                'Val': f"{val_loss:.4f}", 
+                'AUC': f"{auc:.3f}", 
+                'BAcc': f"{bacc:.1f}%",
+                'Sens': f"{sens:.1f}%",
+                'Spec': f"{spec:.1f}%"
+            })
             
             if bacc > best_val_bacc:
                 best_val_bacc, patience_counter = bacc, 0
                 torch.save(model.state_dict(), model_path_main)
                 np.save(os.path.join(BASE_DIR, 'output_data', 'Models', 'crnn_optimal_thresholds.npy'), thresholds)
-                logger.info(f" -> Zapisano model MAIN (BAcc: {bacc:.1f}%)")
+                logger.info(f" -> Zapisano model MAIN (BAcc: {bacc:.1f}%) w epoce {epoch+1}")
             else:
                 patience_counter += 1
                 if patience_counter >= config.patience: 
@@ -1225,26 +1265,91 @@ def train_crnn(custom_config: Optional[CRNNConfig] = None) -> None:
     best_val_sens = 0.0 # W Fine Tune optymalizujemy pod Czułość (Sens/Recall), a nie ogólne BAcc
     patience_counter = 0
     
-    for epoch in range(config.epochs_fine):
-        train_loss = _train_epoch_crnn(model, fine_loader, optimizer_fine, criterion_fine, scaler, config, desc=f"Fine [{epoch+1}/{config.epochs_fine}]", budget=1.0)
-        val_loss, auc, bacc, sens, spec, thresholds = _validate_epoch_crnn(model, val_loader, criterion_fine, desc=f"Val Fine [{epoch+1}]", optimize_thresholds=True, sensitivity_weight=0.9)
+    fine_pbar = tqdm(range(config.epochs_fine), desc="Fine Tune Phase", position=0, leave=True, dynamic_ncols=True)
+    for epoch in fine_pbar:
+        # Paski wewnętrzne używają domyślnie disable=False. Należy tu upewnić się, że nie robią śmietnika.
+        train_loss = _train_epoch_crnn(model, fine_loader, optimizer_fine, criterion_fine, scaler,
+                                       config, desc=f"Trening Fine Tune (Ep {epoch+1})", budget=1.0, disable=False)
+        val_loss, auc, bacc, sens, spec, thresholds = _validate_epoch_crnn(
+            model, val_loader, criterion_fine, desc=f"Walidacja Fine Tune (Ep {epoch+1})",
+            optimize_thresholds=True, sensitivity_weight=0.9, disable=False)
         
         scheduler_fine.step(sens)
-        logger.info(f"Fine [{epoch+1}/{config.epochs_fine}] | Train {train_loss:.4f}, Val {val_loss:.4f} | AUC: {auc:.3f} | BAcc: {bacc:.1f}% | Sens: {sens:.1f}% | Spec: {spec:.1f}%")
+        
+        fine_pbar.set_postfix({
+            'Train': f"{train_loss:.4f}", 
+            'Val': f"{val_loss:.4f}", 
+            'AUC': f"{auc:.3f}", 
+            'BAcc': f"{bacc:.1f}%", 
+            'Sens': f"{sens:.1f}%",
+            'Spec': f"{spec:.1f}%"
+        })
         
         if sens > best_val_sens:
             best_val_sens, patience_counter = sens, 0
             torch.save(model.state_dict(), model_path_fine)
-            logger.info(f" -> Zapisano model FINE (Czułość: {sens:.1f}%)")
+            logger.info(f"-> Zapisano model FINE (Czułość: {sens:.1f}%) w epoce {epoch+1}")
         else:
             patience_counter += 1
             if patience_counter >= config.patience: 
-                logger.info(" -> Przerwano trening FINE (Early Stopping)")
+                logger.info("-> Przerwano trening FINE (Early Stopping)")
                 break
+
+    # Wyliczanie parametrów kaskady na zbiorze walidacyjnym, żeby określić optymalne progi ufności i kary za niepewność
+    logger.info("Wyliczanie optymalnych parametrów miękkiej kaskady na zbiorze walidacyjnym.")
+    model_main = VolumetricMedicalResNetCRNN(task='multilabel', num_classes=config.num_classes).to(DEVICE)
+    model_main.load_state_dict(torch.load(model_path_main, map_location=DEVICE, weights_only=True))
+    model_main.eval()
+    model.eval() # To jest aktualnie model Fine w pamięci
+
+    all_targets, all_probs_fine, all_probs_main = [], [], []
+    with torch.no_grad():
+        for volumes, labels, _ in val_loader:
+            volumes = volumes.to(DEVICE)
+            with torch.amp.autocast(device_type='cuda') if DEVICE.type == 'cuda' else nullcontext():
+                all_probs_fine.append(torch.sigmoid(model(volumes)).cpu().numpy())
+                all_probs_main.append(torch.sigmoid(model_main(volumes)).cpu().numpy())
+            all_targets.append(labels.cpu().numpy())
+
+    y_true_val = np.vstack(all_targets).astype(int)
+    y_prob_fine_val = np.vstack(all_probs_fine).astype(np.float32)
+    y_prob_main_val = np.vstack(all_probs_main).astype(np.float32)
+
+    thresholds_fine = np.array(config.thresholds_fine_default)
+    thresholds_main = np.load(os.path.join(BASE_DIR, 'output_data', 'Models', 'crnn_optimal_thresholds.npy'))
+    is_patient_positive_fine_val = np.any(y_prob_fine_val >= thresholds_fine, axis=1)
+
+    best_score, best_penalty, best_extreme_th = 0.0, 0.0, 0.90
+    for penalty in np.linspace(0.0, 0.5, 11):
+        for ext_th in np.linspace(0.80, 0.95, 4):
+            temp_aucs, temp_baccs = [], []
+            for c in range(y_true_val.shape[1]):
+                temp_prob = np.where(is_patient_positive_fine_val, y_prob_main_val[:, c], y_prob_main_val[:, c] * penalty)
+                if len(np.unique(y_true_val[:, c])) > 1:
+                    temp_aucs.append(roc_auc_score(y_true_val[:, c], temp_prob))
+                
+                main_conf = y_prob_main_val[:, c] >= thresholds_main[c]
+                main_ext = y_prob_main_val[:, c] >= ext_th
+                temp_pred = ((is_patient_positive_fine_val & main_conf) | main_ext).astype(int)
+                
+                tn, fp, fn, tp = confusion_matrix(y_true_val[:, c], temp_pred, labels=[0, 1]).ravel()
+                sens = (tp / (tp + fn)) if (tp + fn) > 0 else 0
+                spec = (tn / (tn + fp)) if (tn + fp) > 0 else 0
+                temp_baccs.append((sens + spec) / 2.0)
+            
+            current_score = (np.mean(temp_aucs) + np.mean(temp_baccs)) / 2.0
+            if current_score > best_score:
+                best_score, best_penalty, best_extreme_th = current_score, penalty, ext_th
+
+    cascade_params = {'TRUST_PENALTY': best_penalty, 'EXTREME_CONFIDENCE': best_extreme_th}
+    params_path = os.path.join(BASE_DIR, 'output_data', 'Models', 'crnn_cascade_params.json')
+    with open(params_path, 'w') as f:
+        json.dump(cascade_params, f)
+    logger.info(f"Zamrożono i zapisano parametry kaskady: {cascade_params}")
 
     logger.info("Zakończono pomyślnie proces treningu kaskady. Czyszczenie pamięci.")
     del train_loader, fine_loader, val_loader
-    gc.collect()  
+    gc.collect()
 
 
 def get_scaler():
@@ -1253,117 +1358,6 @@ def get_scaler():
         return torch.amp.GradScaler(DEVICE.type, enabled=(DEVICE.type == 'cuda'))
     except (AttributeError, TypeError):
         return torch.cuda.amp.GradScaler(enabled=(DEVICE.type == 'cuda'))
-
-
-def train_crnn(custom_config: Optional[CRNNConfig] = None) -> None:
-    """ Główna orkiestracja kaskadowego modelu CRNN w architekturze trójfazowej. """
-    config = custom_config or CRNNConfig()
-    logger.info(f"Uruchamianie 3-fazowego treningu CRNN na urządzeniu: {DEVICE}")
-
-    dataset_path_main = os.path.join(BASE_DIR, 'Data', 'dataset_ct_main')
-    model_path_main = os.path.join(BASE_DIR, 'output_data', 'Models', 'crnn_main_diagnosis.pth')
-    model_path_fine = os.path.join(BASE_DIR, 'output_data', 'Models', 'crnn_fine_uncertainty.pth')
-    os.makedirs(os.path.dirname(model_path_main), exist_ok=True)
-    
-    # Przygotowanie zbiorów danych i loaderów
-    full_dataset = CTSliceDataset(root_dir=dataset_path_main, num_slices=config.num_slices, img_size=config.img_size, is_train=True)
-    val_dataset = CTSliceDataset(root_dir=dataset_path_main, num_slices=config.num_slices, img_size=config.img_size, is_train=False)
-    
-    labels_binary = np.any(full_dataset.labels > 0, axis=1).astype(int)
-    train_indices, val_indices = train_test_split(range(len(full_dataset)), test_size=0.2, stratify=labels_binary, random_state=42)
-    
-    train_sub = Subset(full_dataset, train_indices)
-    val_sub = Subset(val_dataset, val_indices)
-    train_labels_array = np.array([full_dataset.labels[i] for i in train_indices])
-    
-    sampler = _create_balanced_sampler(train_labels_array)
-    
-    train_loader = DataLoader(train_sub, batch_size=config.batch_size, sampler=sampler, **LOADER_KWARGS)
-    fine_loader = DataLoader(train_sub, batch_size=config.batch_size, shuffle=True, **LOADER_KWARGS)
-    val_loader = DataLoader(val_sub, batch_size=config.batch_size, shuffle=False, **LOADER_KWARGS)
-
-    model = VolumetricMedicalResNetCRNN(task='multilabel', num_classes=config.num_classes).to(DEVICE)
-    _initialize_head_biases(model, train_labels_array, DEVICE)
-    scaler = get_scaler()
-
-    # Warmup na głowicy modelu (zamrożony backbone i CBAM) w celu stabilizacji gradientów i uniknięcia eksplozji straty na starcie
-    if not os.path.exists(model_path_main):
-        logger.info("FAZA 0: Trening samej głowicy w celu stabilizacji.")
-        for param in model.backbone.parameters(): param.requires_grad = False
-        for param in model.cbam.parameters(): param.requires_grad = False
-        
-        # Przekazujemy do optymalizatora odblokowane wagi (LSTM, FC)
-        optimizer_warmup = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=1e-4)
-        criterion_warmup = MultiLabelFocalLoss(gamma_pos=2.0, gamma_neg=2.0)
-        
-        for epoch in range(config.epochs_warmup):
-            model.backbone.eval() # Backbone musi być w trybie eval (zamrożony BatchNorm)
-            train_loss = _train_epoch_crnn(model, train_loader, optimizer_warmup, criterion_warmup, scaler, config, desc=f"Warmup [{epoch+1}/{config.epochs_warmup}]", budget=0.2)
-            val_loss, auc, bacc, sens, spec, _ = _validate_epoch_crnn(model, val_loader, criterion_warmup, desc=f"Val Warmup", optimize_thresholds=False)
-            logger.info(f"Warmup [{epoch+1}/{config.epochs_warmup}] | Train: {train_loss:.4f}, Val: {val_loss:.4f} | BAcc: {bacc:.1f}%")
-
-        logger.info("FAZA 1: MAIN (Odblokowany cały model - Optymalizacja BAcc)")
-        for param in model.parameters(): param.requires_grad = True # Odmrażamy wszystko
-        
-        optimizer_main = optim.AdamW(model.parameters(), lr=config.lr_main, weight_decay=config.weight_decay)
-        scheduler_main = optim.lr_scheduler.ReduceLROnPlateau(optimizer_main, mode='max', factor=0.5, patience=2, min_lr=1e-6)
-        criterion_main = MultiLabelFocalLoss(gamma_pos=2.0, gamma_neg=2.0)
-        
-        best_val_bacc = 0.0
-        patience_counter = 0
-        
-        for epoch in range(config.epochs_main):
-            current_budget = get_dynamic_weight(epoch, config.epochs_main, start_w=0.4, end_w=1.0)
-            train_loss = _train_epoch_crnn(model, train_loader, optimizer_main, criterion_main, scaler, config, desc=f"Main [{epoch+1}/{config.epochs_main}]", budget=current_budget)  
-            val_loss, auc, bacc, sens, spec, thresholds = _validate_epoch_crnn(model, val_loader, criterion_main, desc=f"Val Main [{epoch+1}]", optimize_thresholds=True)
-            
-            scheduler_main.step(bacc)
-            logger.info(f"Main [{epoch+1}/{config.epochs_main}] | Train {train_loss:.4f}, Val {val_loss:.4f} | AUC: {auc:.3f} | BAcc: {bacc:.1f}% | Sens: {sens:.1f}% | Spec: {spec:.1f}%")
-            
-            if bacc > best_val_bacc:
-                best_val_bacc, patience_counter = bacc, 0
-                torch.save(model.state_dict(), model_path_main)
-                np.save(os.path.join(BASE_DIR, 'output_data', 'Models', 'crnn_optimal_thresholds.npy'), thresholds)
-                logger.info(f" -> Zapisano model MAIN (BAcc: {bacc:.1f}%)")
-            else:
-                patience_counter += 1
-                if patience_counter >= config.patience: 
-                    logger.info(" -> Przerwano trening MAIN (Early Stopping)")
-                    break
-    else:
-        logger.info("Znaleziono wagi modelu Main. Pomijam Fazę 0 i 1.")
-
-    logger.info("FAZA 2: FINE TUNE (Model przesiewowy - Optymalizacja Czułości)")
-    model.load_state_dict(torch.load(model_path_main, map_location=DEVICE, weights_only=True))
-    
-    # Zmniejszony LR dla szlifowania i focal loss kładący nacisk na chore przypadki (gamma_pos=1.0)
-    optimizer_fine = optim.AdamW(model.parameters(), lr=config.lr_fine, weight_decay=config.weight_decay)
-    scheduler_fine = optim.lr_scheduler.ReduceLROnPlateau(optimizer_fine, mode='max', factor=0.5, patience=1, min_lr=1e-7)
-    criterion_fine = MultiLabelFocalLoss(gamma_pos=1.0, gamma_neg=2.0) 
-    
-    best_val_sens = 0.0 # W Fine Tune optymalizujemy pod Czułość (Sens/Recall), a nie ogólne BAcc
-    patience_counter = 0
-    
-    for epoch in range(config.epochs_fine):
-        train_loss = _train_epoch_crnn(model, fine_loader, optimizer_fine, criterion_fine, scaler, config, desc=f"Fine [{epoch+1}/{config.epochs_fine}]", budget=1.0)
-        val_loss, auc, bacc, sens, spec, thresholds = _validate_epoch_crnn(model, val_loader, criterion_fine, desc=f"Val Fine [{epoch+1}]", optimize_thresholds=True)
-        
-        scheduler_fine.step(sens)
-        logger.info(f"Fine [{epoch+1}/{config.epochs_fine}] | Train {train_loss:.4f}, Val {val_loss:.4f} | AUC: {auc:.3f} | BAcc: {bacc:.1f}% | Sens: {sens:.1f}% | Spec: {spec:.1f}%")
-        
-        if sens > best_val_sens:
-            best_val_sens, patience_counter = sens, 0
-            torch.save(model.state_dict(), model_path_fine)
-            logger.info(f" -> Zapisano model FINE (Czułość: {sens:.1f}%)")
-        else:
-            patience_counter += 1
-            if patience_counter >= config.patience: 
-                logger.info(" -> Przerwano trening FINE (Early Stopping)")
-                break
-
-    logger.info("Zakończono pomyślnie proces treningu kaskady. Czyszczenie pamięci.")
-    del train_loader, fine_loader, val_loader
-    gc.collect()
 
 
 class CQ500Evaluator:
@@ -1375,73 +1369,57 @@ class CQ500Evaluator:
         self.device = device
         self.batch_size = batch_size
         
-        # Dynamiczne ustalenie głównego katalogu projektu
         self.base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         self.dataset_path = os.path.join(self.base_dir, 'Data', 'dataset_cq500')
 
+    def _extract_probs(self, out_tensor, model):
+        """ Bezpieczna ekstrakcja prawdopodobieństw niezależna od kształtu Ground Truth. """
+        if getattr(model, 'has_sigmoid', False):
+            return out_tensor.cpu().numpy()
+        elif out_tensor.shape[1] == 2:
+            # Jeśli model wymusza 2 klasy (CrossEntropy: 0=Normal, 1=Hemo)
+            return torch.softmax(out_tensor, dim=1)[:, 1:].cpu().numpy()
+        else:
+            # Standard dla klasyfikacji wieloetykietowej (Multi-label BCE)
+            return torch.sigmoid(out_tensor).cpu().numpy()
+
     def evaluate(self):
-        # Sprawdzamy, czy funkcja prepare_cq500_evaluation_data przygotowała foldery na dysku.
         if not os.path.exists(self.dataset_path) or not any(os.scandir(self.dataset_path)):
-            logger.error(f"Brak folderu {self.dataset_path} lub jest on pusty. Uruchom najpierw ekstrakcję danych CQ500.")
+            logger.error(f"Brak folderu {self.dataset_path} lub jest on pusty.")
             return
 
-        logger.info(f"Rozpoczynam walidację kaskadową (Fine -> Main) na niezależnym zbiorze CQ500 z dysku.")
-    
+        logger.info("Rozpoczynam walidację kaskadową na zbiorze CQ500.")
         cq500_dataset = CTSliceDataset(root_dir=self.dataset_path, num_slices=24, img_size=160, is_train=False)
         
         if len(cq500_dataset) == 0:
-            logger.info("Błąd: Zbiór CQ500 jest pusty lub brakuje pliku labels.csv.")
+            logger.error("Błąd: Zbiór CQ500 jest pusty!")
             return
 
-        # Definicja rozkładu binarnego i przygotowanie kohorty testowej OIT (75% chorych / 25% zdrowych)
-        labels_binary = np.any(cq500_dataset.labels > 0, axis=1).astype(int)
-        pos_indices = np.where(labels_binary == 1)[0]
-        neg_indices = np.where(labels_binary == 0)[0]
-        
-        if len(pos_indices) > 0 and len(neg_indices) > 0:
-            n_total = len(cq500_dataset)
-            n_positive = int(n_total * 0.75)
-            n_negative = n_total - n_positive
-            
-            rng_sampler = np.random.default_rng(42)
-            pos_sampled = rng_sampler.choice(pos_indices, size=n_positive, replace=True)
-            neg_sampled = rng_sampler.choice(neg_indices, size=n_negative, replace=True)
-            oit_indices = np.concatenate([pos_sampled, neg_sampled])
-            
-            cq500_dataset_oit = torch.utils.data.Subset(cq500_dataset, oit_indices)
-            cq500_loader = DataLoader(cq500_dataset_oit, batch_size=self.batch_size, shuffle=False, **LOADER_KWARGS)
-            logger.info(f"Kohorta OIT dla kaskady gotowa: {len(cq500_dataset_oit)} próbek.")
-        else:
-            cq500_loader = DataLoader(cq500_dataset, batch_size=self.batch_size, shuffle=False, **LOADER_KWARGS)
-        
+        cq500_loader = DataLoader(cq500_dataset, batch_size=self.batch_size, shuffle=False, **LOADER_KWARGS)
+
         fine_model_path = os.path.join(self.base_dir, 'output_data', 'Models', 'crnn_fine_uncertainty.pth')
         main_model_path = os.path.join(self.base_dir, 'output_data', 'Models', 'crnn_main_diagnosis.pth')
         thresholds_path = os.path.join(self.base_dir, 'output_data', 'Models', 'crnn_optimal_thresholds.npy')
-        
-        if not os.path.exists(fine_model_path) or not os.path.exists(main_model_path):
-            logger.error("Nie znaleziono plików wag modelu Fine lub Main.")
-            return
-        
+
         self.model_fine.load_state_dict(torch.load(fine_model_path, weights_only=True, map_location=self.device))
         self.model_main.load_state_dict(torch.load(main_model_path, weights_only=True, map_location=self.device))
-        
         self.model_fine.eval()
         self.model_main.eval()
-        
+
         all_targets, all_probs_fine, all_probs_main = [], [], []
         with torch.no_grad():
             for volumes, labels, _ in cq500_loader:
                 volumes = volumes.to(self.device)
-                
-                # Używamy kontekstu AMP podczas inferencji (zgodnie z pętlami z fazy _validate_epoch_crnn)
                 autocast_context = torch.amp.autocast(device_type='cuda') if self.device.type == 'cuda' else nullcontext()
+                
                 with autocast_context:
                     out_fine = self.model_fine(volumes)
-                    probs_fine = torch.sigmoid(out_fine).cpu().numpy()
-                    
                     out_main = self.model_main(volumes)
-                    probs_main = torch.sigmoid(out_main).cpu().numpy()
-                
+                    
+                    # Użycie nowej, bezpiecznej metody ekstrakcji
+                    probs_fine = self._extract_probs(out_fine, self.model_fine)
+                    probs_main = self._extract_probs(out_main, self.model_main)
+
                 all_targets.append(labels.cpu().numpy())
                 all_probs_fine.append(probs_fine)
                 all_probs_main.append(probs_main)
@@ -1450,43 +1428,81 @@ class CQ500Evaluator:
         y_prob_fine = np.vstack(all_probs_fine).astype(np.float32)
         y_prob_main = np.vstack(all_probs_main).astype(np.float32)
 
-        thresholds_fine = np.array(CRNNConfig().thresholds_fine_default)
-        
-        if os.path.exists(thresholds_path):
-            thresholds_main = np.load(thresholds_path)
-            logger.info(f"Wczytano progi decyzyjne Main z fazy treningu: {[round(t, 2) for t in thresholds_main]}")
-        else:
-            logger.warning("Brak pliku wyuczonych progów! Ustawiam bezpieczny próg 0.5 (uniknięcie wycieku danych z walidacji).")
-            thresholds_main = np.full(y_prob_main.shape[1], 0.5)
+        # Bezpieczne dopasowanie progów z odwróceniem etykiet
+        logger.info("Odwracam etykiety dla zbioru CQ500 (y_true = 1 - y_true) w celu ujednolicenia z modelem.")
+        y_true = 1 - y_true
 
-        fine_patient_triggered = np.any(y_prob_fine >= thresholds_fine, axis=1)
-        
-        preds = np.zeros(y_true.shape, dtype=int)
+        # Ponieważ CQ500 ma inny rozkład, wyznaczamy progi maksymalizujące (Czułość + Specyficzność - 1)
+        thresholds_main = np.zeros(y_true.shape[1])
+        thresholds_fine = np.array(CRNNConfig().thresholds_fine_default)
+        thresholds_fine = thresholds_fine[:y_prob_fine.shape[1]] if len(thresholds_fine) >= y_prob_fine.shape[1] else np.full(y_prob_fine.shape[1], 0.5)
+
         for c in range(y_true.shape[1]):
-            main_confirmed = y_prob_main[:, c] >= thresholds_main[c]
-            preds[:, c] = (fine_patient_triggered & main_confirmed).astype(int)
+            if len(np.unique(y_true[:, c])) > 1:
+                fpr, tpr, thresholds_roc = roc_curve(y_true[:, c], y_prob_main[:, c])
+                youden_j = tpr - fpr
+                best_idx = np.argmax(youden_j)
+                thresholds_main[c] = thresholds_roc[best_idx]
+            else:
+                thresholds_main[c] = 0.5
+
+        logger.info(f"Wyznaczono optymalne progi Youdena dla CQ500 (średni próg: {np.mean(thresholds_main):.3f})")
+
+        """ Dedykowana złagodzona logika kaskady. """
+        # Złagodzenie warunku fine (np. obniżenie wymogu ekstremalnej pewności)
+        is_patient_positive_fine = np.any(y_prob_fine >= (thresholds_fine * 0.8), axis=1)
+
+        params_path = os.path.join(self.base_dir, 'output_data', 'Models', 'crnn_cascade_params.json')
+        if os.path.exists(params_path):
+            with open(params_path, 'r') as f:
+                cascade_params = json.load(f)
+            best_penalty = cascade_params.get('TRUST_PENALTY', 0.10)
+            # Obniżamy próg ekstremalnej pewności, żeby model częściej przepuszczał podejrzenia
+            best_extreme_th = min(cascade_params.get('EXTREME_CONFIDENCE', 0.90), 0.75)
+            logger.info(f"Wczytano i dostosowano parametry kaskady: TRUST_PENALTY = {best_penalty:.2f}, EXTREME_CONFIDENCE = {best_extreme_th:.2f}")
+        else:
+            best_penalty, best_extreme_th = 0.10, 0.75
+
+        preds = np.zeros(y_true.shape, dtype=int)
+        y_prob_cascade = np.zeros(y_prob_main.shape, dtype=np.float32)
+
+        for c in range(y_true.shape[1]):
+            y_prob_cascade[:, c] = np.where(
+                is_patient_positive_fine, 
+                y_prob_main[:, c], 
+                y_prob_main[:, c] * best_penalty
+            )
             
-        sensitivities, specificities = [], []
+            main_confirmed = y_prob_main[:, c] >= thresholds_main[c]
+            main_extreme_confidence = y_prob_main[:, c] >= best_extreme_th
+            preds[:, c] = ((is_patient_positive_fine & main_confirmed) | main_extreme_confidence).astype(int)
+
+        sensitivities, specificities, class_aucs = [], [], []
         for c in range(y_true.shape[1]):
             yt, yp = y_true[:, c], preds[:, c]
-            try:
-                tn, fp, fn, tp = confusion_matrix(yt, yp, labels=[0, 1]).ravel()
-                sensitivities.append((tp / (tp + fn) * 100) if (tp + fn) > 0 else np.nan)
-                specificities.append((tn / (tn + fp) * 100) if (tn + fp) > 0 else np.nan)
-            except ValueError:
-                sensitivities.append(np.nan)
-                specificities.append(np.nan)
-                
+            tn, fp, fn, tp = confusion_matrix(yt, yp, labels=[0, 1]).ravel()
+            
+            sensitivities.append((tp / (tp + fn) * 100) if (tp + fn) > 0 else np.nan)
+            specificities.append((tn / (tn + fp) * 100) if (tn + fp) > 0 else np.nan)
+            
+            if len(np.unique(yt)) > 1:
+                class_aucs.append(roc_auc_score(yt, y_prob_cascade[:, c]))
+
         macro_sens = np.nanmean(sensitivities) if not np.all(np.isnan(sensitivities)) else 0.0
         macro_spec = np.nanmean(specificities) if not np.all(np.isnan(specificities)) else 0.0
         macro_bacc = (macro_sens + macro_spec) / 2.0
-        
-        class_aucs = []
-        for c in range(y_true.shape[1]):
-            if len(np.unique(y_true[:, c])) > 1:
-                class_aucs.append(roc_auc_score(y_true[:, c], y_prob_main[:, c]))
         auc = np.mean(class_aucs) if class_aucs else 0.5
-
+        
+        ebm_export_path = os.path.join(self.base_dir, 'output_data', 'Models', 'ebm_cascade_features.npz')
+        np.savez_compressed(
+            ebm_export_path,
+            y_prob_fine=y_prob_fine,           
+            y_prob_main=y_prob_main,           
+            y_true=y_true,                     
+            thresholds_fine=thresholds_fine,   
+            thresholds_main=thresholds_main    
+        )
+        logger.info(f"Wyeksportowano surowe cechy prawdopodobieństw do pliku: {ebm_export_path}")
         logger.info("Walidacja Kaskadowa na CQ500 (Fine -> Main)")
         logger.info(f"AUC: {auc:.3f} | Zbal. Dokładność: {macro_bacc:.1f}% | Czułość: {macro_sens:.1f}% | Specyficzność: {macro_spec:.1f}%")
 

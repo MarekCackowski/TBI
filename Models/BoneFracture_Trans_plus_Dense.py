@@ -1,4 +1,5 @@
 # Konfiguracja środowiska i ograniczenie wątków backendów C++
+import json
 import os
 os.environ["OMP_NUM_THREADS"] = "4"
 os.environ["MKL_NUM_THREADS"] = "4"
@@ -54,13 +55,31 @@ from tqdm import tqdm
 load_dotenv()
 warnings.filterwarnings("ignore", message=".*Detected call of `lr_scheduler.step()`.*", category=UserWarning)
 
-# Inicjalizacja systemu logowania (usunięto błąd składniowy i podwójne wywołanie)
-logging.basicConfig(
-    level=logging.INFO,
-    format='[%(asctime)s] %(levelname)s\n%(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
-)
-logger = logging.getLogger(__name__)
+# Inicjalizacja systemu logowania
+def setup_logger(name="CRNN", level=logging.INFO):
+    class _TqdmStream:
+        def write(self, buf):
+            tqdm.write(buf, end="")
+
+        def flush(self):
+            pass
+
+    logger = logging.getLogger(name)
+    logger.setLevel(level)
+
+    # Używamy instancji _TqdmStream(), żeby logi nie kolidowały z paskiem postępu tqdm
+    handler = logging.StreamHandler(stream=_TqdmStream())
+    handler.setFormatter(
+        logging.Formatter("[%(asctime)s] %(levelname)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+    )
+
+    if not logger.handlers:
+        logger.addHandler(handler)
+
+    return logger
+
+logger = setup_logger()
+
 
 # Dynamiczne wykrywanie ścieżki do głównego katalogu projektu
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -115,7 +134,7 @@ class SkullFractureDataset3D(Dataset):
         # Inicjalizacja adaptacyjnego transformatora okna kostnego
         self.bone_window = BoneWindowTransform(percentile=88)
         
-        # Standaryzacja do RGB
+        # Standaryzacja do BGR i normalizacja do zakresu [-1, 1] dla MONAI
         base_transforms = [
             transforms.Resize((img_size, img_size)),
             transforms.ToImage(),
@@ -170,8 +189,14 @@ class SkullFractureDataset3D(Dataset):
             img_path = os.path.join(folder_path, slice_file)
             
             # Wczytanie obrazu
-            img_array = cv.imread(img_path, cv.IMREAD_GRAYSCALE)
-            if img_array is None:
+            try:
+                with Image.open(img_path) as img:
+                    # Konwersja do skali szarości i wymuszenie .copy() dla ciągłości w pamięci RAM
+                    img_array = np.array(img.convert('L')).copy()
+            except (IOError, SyntaxError):
+                continue
+            
+            if img_array is None or img_array.size == 0:
                 continue
             
             # Odfiltrowanie tkanek miękkich za pomocą adaptacyjnego okna
@@ -445,54 +470,55 @@ def _train_epoch(
     device: torch.device, 
     accumulation_steps: int, 
     scheduler: Optional[optim.lr_scheduler.LRScheduler] = None, 
-    desc: str = "Trening"
+    desc: str = "Train"
 ) -> float:
     """ Uniwersalna pętla ucząca obsługująca rozgrzewkę, główny trening oraz CutMix 3D. """
     model.train()
     total_loss = 0.0
     optimizer.zero_grad(set_to_none=True)
     
-    pbar = tqdm(dataloader, desc=desc, leave=False, file=sys.stdout)
-    for i, (images, labels) in enumerate(pbar):
-        images, labels = images.to(device, non_blocking=True), labels.to(device, non_blocking=True)
-        
-        autocast_context = torch.amp.autocast(device_type='cuda') if DEVICE.type == 'cuda' else nullcontext()
-        with autocast_context:
-            if np.random.rand() < 0.5:
-                images_mixed, labels_a, labels_b, lam = cutmix_3d_volume(images, labels)
-                outputs = model(images_mixed)
-                loss = cutmix_criterion(criterion, outputs, labels_a, labels_b, lam)
-            else:
-                outputs = model(images)
-                loss = criterion(outputs, labels)
-            loss = loss / accumulation_steps
+    with tqdm(dataloader, desc=desc, leave=False, dynamic_ncols=True) as batch_pbar:
+        for i, (images, labels) in enumerate(batch_pbar):
+            images, labels = images.to(device, non_blocking=True), labels.to(device, non_blocking=True)
             
-        if torch.isnan(loss) or torch.isinf(loss):
-            optimizer.zero_grad(set_to_none=True)
-            for model_buffer, ema_buffer in zip(model.buffers(), ema_model.ema.buffers()):
-                model_buffer.copy_(ema_buffer)
-            continue
-            
-        scaler.scale(loss).backward()
-        
-        if (i + 1) % accumulation_steps == 0 or (i + 1) == len(dataloader):
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            scaler.step(optimizer)
-            scaler.update()
-            
-            if scheduler:
-                scheduler.step()
+            autocast_context = torch.amp.autocast(device_type='cuda') if DEVICE.type == 'cuda' else nullcontext()
+            with autocast_context:
+                if np.random.rand() < 0.5:
+                    images_mixed, labels_a, labels_b, lam = cutmix_3d_volume(images, labels)
+                    outputs = model(images_mixed)
+                    loss = cutmix_criterion(criterion, outputs, labels_a, labels_b, lam)
+                else:
+                    outputs = model(images)
+                    loss = criterion(outputs, labels)
+                loss = loss / accumulation_steps
                 
-            optimizer.zero_grad(set_to_none=True)
+            if torch.isnan(loss) or torch.isinf(loss):
+                optimizer.zero_grad(set_to_none=True)
+                for model_buffer, ema_buffer in zip(model.buffers(), ema_model.ema.buffers()):
+                    model_buffer.copy_(ema_buffer)
+                continue
+                
+            scaler.scale(loss).backward()
+            
+            if (i + 1) % accumulation_steps == 0 or (i + 1) == len(dataloader):
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                scaler.step(optimizer)
+                scaler.update()
+                
+                if scheduler:
+                    scheduler.step()
+                    
+                optimizer.zero_grad(set_to_none=True)
 
-            for buf in model.buffers():
-                buf.nan_to_num_(nan=0.0, posinf=1.0, neginf=0.0)
+                for buf in model.buffers():
+                    buf.nan_to_num_(nan=0.0, posinf=1.0, neginf=0.0)
 
-            ema_model.update(model)
-        
-        total_loss += loss.item() * accumulation_steps
-        pbar.set_postfix({'loss': f"{loss.item() * accumulation_steps:.4f}"})
+                ema_model.update(model)
+            
+            real_loss = loss.item() * accumulation_steps
+            total_loss += real_loss
+            batch_pbar.set_postfix({'loss': f"{real_loss:.4f}"})
 
     return total_loss / len(dataloader)
 
@@ -502,25 +528,26 @@ def _validate_epoch(
     model: nn.Module, 
     dataloader: DataLoader, 
     criterion: nn.Module, 
-    device: torch.device, 
-    desc: str = "Walidacja"
+    device: torch.device,
+    desc: str = "Val"
 ) -> Tuple[float, float, str, float, float, float]:
     """ Ewaluacja modelu zwracająca kluczowe metryki diagnostyczne. """
     model.eval()
     val_loss = 0.0
     all_labels, all_probs = [], []
     
-    pbar = tqdm(dataloader, desc=desc, leave=False, file=sys.stdout)
-    for images, labels in pbar:
-        images, labels = images.to(device, non_blocking=True), labels.to(device, non_blocking=True)
-        outputs = model(images)
-        loss = criterion(outputs, labels)
-            
-        val_loss += loss.item() if not torch.isnan(loss) else 1.0  
-            
-        probs = torch.sigmoid(outputs).cpu().numpy()
-        all_probs.extend(np.nan_to_num(probs, nan=0.5, posinf=1.0, neginf=0.0))
-        all_labels.extend(labels.cpu().numpy())
+    with tqdm(dataloader, desc=desc, leave=False, dynamic_ncols=True) as val_pbar:
+        for images, labels in val_pbar:
+            images, labels = images.to(device, non_blocking=True), labels.to(device, non_blocking=True)
+            outputs = model(images)
+            loss = criterion(outputs, labels)
+                
+            val_loss += loss.item() if not torch.isnan(loss) else 1.0  
+            val_pbar.set_postfix({'loss': f"{loss.item():.4f}"})
+                
+            probs = torch.sigmoid(outputs).cpu().numpy()
+            all_probs.extend(np.nan_to_num(probs, nan=0.5, posinf=1.0, neginf=0.0))
+            all_labels.extend(labels.cpu().numpy())
             
     val_loss /= max(1, len(dataloader))
     y_true = np.array(all_labels, dtype=np.float32)
@@ -530,7 +557,7 @@ def _validate_epoch(
         return val_loss, 0.0, "N/A", 0.5, 0.0, 0.0
 
     best_threshold = optimize_binary_threshold(y_true, y_prob)
-    th_val = best_threshold[0] # Wyciągamy czystą wartość float
+    th_val = best_threshold[0] 
     y_pred = np.zeros_like(y_prob, dtype=int)
     
     sensitivities, specificities = [], []
@@ -595,7 +622,10 @@ def train_fracture_detector(train_loader: DataLoader, val_loader: DataLoader, mo
     optimizer = optim.AdamW(model.parameters(), lr=1e-5, weight_decay=1e-2)
 
     for epoch in range(fine_epochs):
-        avg_ft_loss = _train_epoch(model, train_loader, optimizer, criterion, scaler, ema_model, DEVICE, accumulation_steps, desc=f"Rozgrzewka [{epoch+1}/{fine_epochs}]")
+        avg_ft_loss = _train_epoch(
+            model, train_loader, optimizer, criterion, scaler, ema_model, DEVICE, accumulation_steps, 
+            desc=f"Rozgrzewka {model_name} E[{epoch+1}/{fine_epochs}]"
+        )
         logger.info(f"[{model_name}] Rozgrzewka Epoka [{epoch+1}/{fine_epochs}] | Średnia strata treningowa: {avg_ft_loss:.4f}")
 
     logger.info(f"[{model_name}] Trening Główny")
@@ -605,19 +635,25 @@ def train_fracture_detector(train_loader: DataLoader, val_loader: DataLoader, mo
     best_val_score = -float('inf')
 
     for epoch in range(main_epochs):
-        train_loss = _train_epoch(model, train_loader, optimizer, criterion, scaler, ema_model, DEVICE, accumulation_steps, scheduler=scheduler, desc=f"Main [{epoch+1}/{main_epochs}]")
+        train_loss = _train_epoch(
+            model, train_loader, optimizer, criterion, scaler, ema_model, DEVICE, accumulation_steps, scheduler=scheduler, 
+            desc=f"Main {model_name} E[{epoch+1}/{main_epochs}]"
+        )
         
-        val_loss, macro_bacc, th_str, auc, macro_sens, macro_spec = _validate_epoch(model, val_loader_eval, criterion, DEVICE, desc=f"Walidacja OIT [{epoch+1}/{main_epochs}]")
+        val_loss, macro_bacc, th_str, auc, macro_sens, macro_spec = _validate_epoch(
+            model, val_loader_eval, criterion, DEVICE, 
+            desc=f"Val {model_name} E[{epoch+1}/{main_epochs}]"
+        )
         
         if DEVICE.type == 'cuda': torch.cuda.empty_cache()
             
-        logger.info(f"Main [{epoch+1}/{main_epochs}] (EMA) | Strata Treningowa: {train_loss:.4f} | Strata Walidacyjna: {val_loss:.4f} | "
-              f"Progi: {th_str} | AUC: {auc:.3f} | Zbal. Dokładność: {macro_bacc:.1f}% | Czułość: {macro_sens:.1f}% | Specyficzność: {macro_spec:.1f}%")
+        logger.info(f"Main [{epoch+1}/{main_epochs}] (EMA) | Strata T/V: {train_loss:.4f}/{val_loss:.4f} | "
+                    f"Progi: {th_str} | AUC: {auc:.3f} | Zbal. Dokładność: {macro_bacc:.1f}% | Czułość: {macro_sens:.1f}% | Specyficzność: {macro_spec:.1f}%")
 
         if macro_bacc > best_val_score:
             best_val_score = macro_bacc
             torch.save(model.state_dict(), save_path)
-            logger.info(f" Zapisano nowy najlepszy model {model_name} (Kryterium: Zbal. Dokładność = {macro_bacc:.1f}%)!")
+            logger.info(f" ---> Zapisano nowy najlepszy model {model_name} (Zbal. Dokładność: {macro_bacc:.1f}%)")
 
     if not os.path.exists(save_path):
         torch.save(ema_model.ema.state_dict(), save_path)
@@ -629,11 +665,7 @@ def train_fracture_detector(train_loader: DataLoader, val_loader: DataLoader, mo
 
 
 def fine_tune_densenet_with_nifti(dataset_dir, epochs=5):
-    """ Funkcja integracyjna wywoływana przez główny Orkiestrator.
-        Przechwytuje wytrenowany model DenseNet i szlifuje jego wagi na zewnętrznym,
-        dedykowanym zbiorze CT-ICH używając natywnych transformacji MONAI. 
-        Wdraża ewaluację opartą na Zbalansowanej Dokładności. """
-    # Użycie ścieżek absolutnych
+    """ Funkcja integracyjna wywoływana przez główny Orkiestrator. """
     model_path = os.path.join(BASE_DIR, 'output_data', 'Models', 'densenet_fracture_best.pth')
     save_path = os.path.join(BASE_DIR, 'output_data', 'Models', 'densenet_fracture_finetuned.pth')
     
@@ -668,12 +700,13 @@ def fine_tune_densenet_with_nifti(dataset_dir, epochs=5):
         mt.Orientationd(keys=["image"], axcodes="RAS"),
         mt.Spacingd(keys=["image"], pixdim=(1.0, 1.0, 1.0), mode=("bilinear")),
         mt.ScaleIntensityRangePercentilesd(keys=["image"], lower=5, upper=95, b_min=-1.0, b_max=1.0, clip=True),
+        mt.Transposed(keys=["image"], indices=[0, 3, 2, 1]),
         mt.Resized(keys=["image"], spatial_size=(30, 224, 224)),
         mt.RandAffined(
             keys=["image"], prob=0.30,  
             rotate_range=(0.1, 0.1, 0.1), scale_range=(0.02, 0.02, 0.02), translate_range=(2, 2, 2)
         ),
-        mt.RandFlipd(keys=["image"], spatial_axis=0, prob=0.5),
+        mt.RandFlipd(keys=["image"], spatial_axis=2, prob=0.5),
         mt.ToTensord(keys=["image", "label"])
     ])
 
@@ -683,6 +716,7 @@ def fine_tune_densenet_with_nifti(dataset_dir, epochs=5):
         mt.Orientationd(keys=["image"], axcodes="RAS"),
         mt.Spacingd(keys=["image"], pixdim=(1.0, 1.0, 1.0), mode=("bilinear")),
         mt.ScaleIntensityRangePercentilesd(keys=["image"], lower=5, upper=95, b_min=-1.0, b_max=1.0, clip=True),
+        mt.Transposed(keys=["image"], indices=[0, 3, 2, 1]),
         mt.Resized(keys=["image"], spatial_size=(30, 224, 224)),
         mt.ToTensord(keys=["image", "label"])
     ])
@@ -698,14 +732,12 @@ def fine_tune_densenet_with_nifti(dataset_dir, epochs=5):
     
     optimizer = optim.AdamW(model.parameters(), lr=5e-6, weight_decay=1e-4)
     
-    # Obliczenie wagi dla klasy mniejszościowej zapobiega ignorowaniu pęknięć czaszki przez sieć
     pos_count = sum(labels_list)
     neg_count = len(labels_list) - pos_count
     pos_weight_val = neg_count / max(pos_count, 1.0)
     
     criterion = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([pos_weight_val], dtype=torch.float32).to(DEVICE))
 
-    # To, gdzie jest GradScaler, zależy od wersji PyTorch. W nowszych wersjach jest w torch.amp, w starszych w torch.cuda.amp
     try:
         scaler = torch.amp.GradScaler(DEVICE.type, enabled=(DEVICE.type == 'cuda'))
     except AttributeError:
@@ -719,48 +751,50 @@ def fine_tune_densenet_with_nifti(dataset_dir, epochs=5):
         train_loss = 0.0
         optimizer.zero_grad(set_to_none=True)
         
-        ft_pbar = tqdm(train_loader, desc=f"NIfTI Fine Tune [{epoch+1}/{epochs}]", leave=False, file=sys.stdout)
-        for i, batch in enumerate(ft_pbar):
-            images = batch["image"].to(DEVICE, non_blocking=True)
-            labels = batch["label"].to(DEVICE, non_blocking=True)
-            
-            autocast_context = torch.amp.autocast(device_type='cuda') if DEVICE.type == 'cuda' else nullcontext()
-            with autocast_context:
-                outputs = model(images)
-                loss = criterion(outputs, labels)
-                loss = loss / accumulation_steps
-
-                if torch.isnan(loss) or torch.isinf(loss):
-                    optimizer.zero_grad(set_to_none=True)
-                    continue
-                
-            scaler.scale(loss).backward()
-            
-            if (i + 1) % accumulation_steps == 0 or (i + 1) == len(train_loader):
-                scaler.step(optimizer)
-                scaler.update()
-                optimizer.zero_grad(set_to_none=True)
-                
-            train_loss += loss.item() * accumulation_steps
-            ft_pbar.set_postfix({'loss': f"{loss.item() * accumulation_steps:.4f}"})
-            
-        train_loss /= len(train_loader)
-        
-        model.eval()
-        all_labels, all_probs = [], []
-        
-        with torch.no_grad():
-            for batch in val_loader:
+        with tqdm(train_loader, desc=f"NIfTI E[{epoch+1}/{epochs}] Train", leave=False, dynamic_ncols=True) as train_pbar:
+            for i, batch in enumerate(train_pbar):
                 images = batch["image"].to(DEVICE, non_blocking=True)
                 labels = batch["label"].to(DEVICE, non_blocking=True)
                 
                 autocast_context = torch.amp.autocast(device_type='cuda') if DEVICE.type == 'cuda' else nullcontext()
                 with autocast_context:
                     outputs = model(images)
-                    probs = torch.sigmoid(outputs).cpu().numpy()
+                    loss = criterion(outputs, labels)
+                    loss = loss / accumulation_steps
+
+                    if torch.isnan(loss) or torch.isinf(loss):
+                        optimizer.zero_grad(set_to_none=True)
+                        continue
                     
-                all_probs.extend(probs)
-                all_labels.extend(labels.cpu().numpy())
+                scaler.scale(loss).backward()
+                
+                if (i + 1) % accumulation_steps == 0 or (i + 1) == len(train_loader):
+                    scaler.step(optimizer)
+                    scaler.update()
+                    optimizer.zero_grad(set_to_none=True)
+                    
+                real_loss = loss.item() * accumulation_steps
+                train_loss += real_loss
+                train_pbar.set_postfix({'loss': f"{real_loss:.4f}"})
+            
+        train_loss /= len(train_loader)
+        
+        model.eval()
+        all_labels, all_probs = [], []
+        
+        with tqdm(val_loader, desc=f"NIfTI E[{epoch+1}/{epochs}] Val", leave=False, dynamic_ncols=True) as val_pbar:
+            with torch.no_grad():
+                for batch in val_pbar:
+                    images = batch["image"].to(DEVICE, non_blocking=True)
+                    labels = batch["label"].to(DEVICE, non_blocking=True)
+                    
+                    autocast_context = torch.amp.autocast(device_type='cuda') if DEVICE.type == 'cuda' else nullcontext()
+                    with autocast_context:
+                        outputs = model(images)
+                        probs = torch.sigmoid(outputs).cpu().numpy()
+                        
+                    all_probs.extend(probs)
+                    all_labels.extend(labels.cpu().numpy())
 
         y_true = np.array(all_labels).astype(int).flatten()
         y_prob = np.array(all_probs).flatten()
@@ -777,13 +811,13 @@ def fine_tune_densenet_with_nifti(dataset_dir, epochs=5):
                 
             bacc = (sens + spec) / 2.0
             
-            logger.info(f"NIfTI Fine Tune Epoka {epoch+1} | Strata treningowa: {train_loss:.4f} | Zbal. Dokładność: {bacc:.1f}% | Czułość: {sens:.1f}% | Specyficzność: {spec:.1f}%")
+            logger.info(f"NIfTI Fine Tune Epoka {epoch+1} | Strata treningowa: {train_loss:.4f} | "
+                        f"Zbal. Dokładność: {bacc:.1f}% | Czułość: {sens:.1f}% | Specyficzność: {spec:.1f}%")
             
-            # Zapis na podstawie Zbal. Dokładności
             if bacc > best_val_score:
                 best_val_score = bacc
                 torch.save(model.state_dict(), save_path)
-                logger.info(f" -> Ostateczny szlif zapisany! (Kryterium: Zbal. Dokładność = {bacc:.1f}%)")
+                logger.info(f" ---> Ostateczny szlif zapisany! (Zbal. Dokładność: {bacc:.1f}%)")
         else:
             logger.warning("Brak wyników walidacji. Zapisuję model awaryjnie.")
             torch.save(model.state_dict(), save_path)
@@ -825,7 +859,32 @@ def train_all_fracture_models(train_loader, val_loader, main_epochs=12, fine_epo
         "ensemble_type": "Soft Voting (DenseNet 3D + Vision Transformer 3D)"
     }
     torch.save(ensemble_package, os.path.join(BASE_DIR, 'output_data', 'Models', 'fracture_best.pth'))
-    
+
+    # Zamrożenie optymalnego progu decyzyjnego zespołu na zbiorze walidacyjnym
+    logger.info("Wyliczanie optymalnego progu zespołowego na zbiorze walidacyjnym.")
+    model_dense = DenseNetFractureDetector(pretrained=False, dropout_rate=0.0).to(DEVICE)
+    model_trans = TransformerFractureDetector3D(dropout_rate=0.0).to(DEVICE)
+    model_dense.load_state_dict(torch.load(ensemble_package["densenet_path"], map_location=DEVICE))
+    model_trans.load_state_dict(torch.load(ensemble_package["transformer_path"], map_location=DEVICE))
+
+    val_targets, val_probs = [], []
+    with torch.no_grad():
+        for volumes, targets in val_loader:
+            probs = ensemble_predict_fracture(volumes, model_dense, model_trans)
+            val_targets.append(targets.numpy())
+            val_probs.append(probs)
+
+    y_true_val = np.vstack(val_targets).astype(int)
+    y_prob_val = np.vstack(val_probs).astype(np.float32)
+
+    opt_th = float(optimize_binary_threshold(y_true_val, y_prob_val)[0])
+    params_path = os.path.join(BASE_DIR, 'output_data', 'Models', 'fracture_threshold.json')
+    import json
+    with open(params_path, 'w') as f:
+        json.dump({'OPTIMAL_THRESHOLD': opt_th}, f)
+
+    logger.info(f"Zamrożono optymalny próg decyzyjny zespołu: {opt_th:.2f}")
+
     logger.info("Oba modele złamań przeszły trening, a pakiet Ensemble zapisano w 'fracture_best.pth'.")
 
 
@@ -853,7 +912,7 @@ class FractureEvaluator:
         logger.info("Przygotowanie danych ewaluacyjnych.")
         
         # Wczytanie pliku CSV ze zbioru (bez etykiet NLP)
-        df_labels = pd.read_csv(labels_csv) if 'pd' in globals() else __import__('pandas').read_csv(labels_csv)
+        df_labels = pd.read_csv(labels_csv)
         patient_folders = []
         labels = []
 
@@ -867,6 +926,7 @@ class FractureEvaluator:
             p_path = os.path.join(images_dir, pid)
             if os.path.exists(p_path):
                 patient_folders.append(p_path)
+
                 # Pobieramy etykietę złamania czaszki (awaryjnie 0.0)
                 val_skull = float(row['CalvarialFracture']) if has_skull else 0.0
                 labels.append([val_skull])
@@ -896,18 +956,25 @@ class FractureEvaluator:
 
         logger.info("Rozpoczynam inferencję zespołu modeli (Uncertainty Aware Soft Voting).")
         with torch.no_grad():
-            for volumes, targets in tqdm(val_loader, desc="Ewaluacja Zespołowa", file=sys.stdout):
-                probs = ensemble_predict_fracture(volumes, model_dense, model_trans)
-                all_targets.append(targets.numpy())
-                all_probs.append(probs)
+            with tqdm(val_loader, desc="Ewaluacja Zespołowa", dynamic_ncols=True) as pbar:
+                for volumes, targets in pbar:
+                    probs = ensemble_predict_fracture(volumes, model_dense, model_trans)
+                    all_targets.append(targets.numpy())
+                    all_probs.append(probs)
 
         y_true = np.vstack(all_targets).astype(int)
         y_prob = np.vstack(all_probs).astype(np.float32)
 
-        # Dobór optymalnego progu na podstawie przewidywań
-        threshold = optimize_binary_threshold(y_true, y_prob)
-        th_val = threshold[0]  # Wyciągamy czystą wartość float z tablicy zwracanej przez funkcję
-        logger.info(f"Wyznaczony optymalny próg decyzyjny dla złamania czaszki: {round(th_val, 2)}")
+        # Wczytanie zamrożonego progu decyzyjnego
+        params_path = os.path.join(BASE_DIR, 'output_data', 'Models', 'fracture_threshold.json')
+        if os.path.exists(params_path):
+            with open(params_path, 'r') as f:
+                params = json.load(f)
+                th_val = params.get('OPTIMAL_THRESHOLD', 0.5)
+            logger.info(f"Wczytano zamrożony próg decyzyjny zespołu: {th_val:.2f}")
+        else:
+            logger.warning("Brak pliku z progami zespołu. Używam domyślnego progu (0.50).")
+            th_val = 0.5
 
         preds = np.zeros_like(y_true, dtype=int)
         for c in range(y_prob.shape[1]):
@@ -980,16 +1047,17 @@ if __name__ == "__main__":
                 np.random.seed(42)
             
             logger.info("Skanowanie folderów pacjentów.")
-            for _, row in tqdm(df_labels.iterrows(), total=len(df_labels), desc="Indeksowanie danych", file=sys.stdout):
-                pid = str(row['name'])
-                p_path = os.path.join(images_dir, pid)
-                if os.path.exists(p_path):
-                    patient_folders.append(p_path)
-                    
-                    # Pobiera dane o czaszce, jeśli istnieją. Brakujące zastępuje losowo (Weak Supervision).
-                    val_skull = float(row['CalvarialFracture']) if has_skull else float(np.random.choice([0, 1], p=[0.8, 0.2]))
-                    
-                    labels.append([val_skull])
+            with tqdm(df_labels.iterrows(), total=len(df_labels), desc="Indeksowanie danych", dynamic_ncols=True) as pbar:
+                for _, row in pbar:
+                    pid = str(row['name'])
+                    p_path = os.path.join(images_dir, pid)
+                    if os.path.exists(p_path):
+                        patient_folders.append(p_path)
+                        
+                        # Pobiera dane o czaszce, jeśli istnieją. Brakujące zastępuje losowo.
+                        val_skull = float(row['CalvarialFracture']) if has_skull else float(np.random.choice([0, 1], p=[0.8, 0.2]))
+                        
+                        labels.append([val_skull])
                     
             if len(patient_folders) > 0:
                 train_size = int(0.8 * len(patient_folders))
@@ -1009,7 +1077,7 @@ if __name__ == "__main__":
 
         logger.info("Rozpoczynam niezależną ewaluację zespołu modeli (DenseNet 3D + Transformer 3D).")
     
-        # Przykładowa inicjalizacja ewaluatora (zmień nazwę klasy na zgodną z Twoim kodem)
+        # Inicjalizacja ewaluatora
         evaluator = FractureEvaluator(
             dense_model_path=dense_path, 
             trans_model_path=trans_path, 

@@ -1,4 +1,5 @@
 # Konfiguracja środowiska i ograniczenie wątków backendów C++
+import json
 import os
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
@@ -57,16 +58,61 @@ from tqdm import tqdm
 load_dotenv()
 
 # Inicjalizacja systemu logowania
-logging.basicConfig(
-    level=logging.INFO,
-    format='[%(asctime)s] %(levelname)s - %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
-)
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
+def setup_logger(name: str = "crnn"):
+    """ Centralny logger: konsole kieruje przez tqdm.write (nie rozbija paskow postepu),
+        a kopie zapisuje do pliku. Zabezpieczony przed podwojna rejestracja handlerow. """
+    logger = logging.getLogger(name)
+    if logger.handlers:
+        return logger
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+
+    fmt = logging.Formatter('[%(asctime)s] %(levelname)s: %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+
+    class _TqdmStream:
+        """ Strumien przekazujacy logi przez tqdm.write, zeby pasek sie nie dublowal. """
+        @classmethod
+        def write(cls, msg):
+            logger.info(msg.rstrip())
+        def flush(cls):
+            sys.stdout.flush()
+
+    ch = logging.StreamHandler(_TqdmStream)
+    ch.setFormatter(fmt)
+    fh = logging.FileHandler("crnn_training.log", encoding="utf-8")
+    fh.setFormatter(fmt)
+
+    logger.addHandler(ch)
+    logger.addHandler(fh)
+    return logger
+
+# Inicjalizacja systemu logowania
+def setup_logger(name="CRNN", level=logging.INFO):
+    class _TqdmStream:
+        def write(self, buf):
+            tqdm.write(buf, end="")
+
+        def flush(self):
+            pass
+
+    logger = logging.getLogger(name)
+    logger.setLevel(level)
+
+    # Używamy instancji _TqdmStream(), żeby logi nie kolidowały z paskiem postępu tqdm
+    handler = logging.StreamHandler(stream=_TqdmStream())
+    handler.setFormatter(
+        logging.Formatter("[%(asctime)s] %(levelname)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+    )
+
+    if not logger.handlers:
+        logger.addHandler(handler)
+
+    return logger
+
+logger = setup_logger()
+
 
 # Połączenia z infrastrukturą
-load_dotenv()
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # Globalne urządzenie dla całego skryptu
@@ -103,7 +149,15 @@ class MedicalImagingConfig:
     window_bone: Tuple[float, float] = (600.0, 2800.0)
     num_slices: int = 30
     img_size: int = 224
-    target_classes: List[str] = field(default_factory=lambda: ['epidural', 'subdural', 'subarachnoid', 'intraparenchymal', 'intraventricular'])
+    target_classes: List[str] = field(
+        default_factory=lambda: [
+            'epidural', 
+            'subdural', 
+            'subarachnoid', 
+            'intraparenchymal', 
+            'intraventricular'
+        ]
+    )
 
 @dataclass
 class EfficientNetTrainingConfig:
@@ -125,7 +179,7 @@ def _has_images(folder: str) -> bool:
 
 def prepare_rsna_data(zip_path, csv_path, output_dir, limit_patients=10000, imaging_config: Optional[MedicalImagingConfig] = None):
     """ Odczytuje etykiety z pliku CSV i wypakowuje w locie określone plastry z archiwum ZIP RSNA 
-        z uwzględnieniem okienkowania HU z MedicalImagingConfig. """
+        z uwzględnieniem okienkowania HU z MedicalImagingConfig (czyste logowanie). """
     if imaging_config is None:
         imaging_config = MedicalImagingConfig()
 
@@ -140,7 +194,6 @@ def prepare_rsna_data(zip_path, csv_path, output_dir, limit_patients=10000, imag
     df = pd.read_csv(csv_path)
     df.columns = df.columns.str.strip()
     
-    # Uniwersalna obsługa ID i skrótów medycznych
     if 'name' in df.columns and 'PatientID' not in df.columns:
         df = df.rename(columns={'name': 'PatientID'})
     elif 'index' in df.columns and 'PatientID' not in df.columns:
@@ -163,31 +216,31 @@ def prepare_rsna_data(zip_path, csv_path, output_dir, limit_patients=10000, imag
     
     with zipfile.ZipFile(zip_path, 'r') as z:
         zip_files = z.namelist()
-        for patient_id in patients:
-            is_dai = df[(df['PatientID'] == patient_id) & (df['Label'] == 1)].shape[0] > 0
-            target_folder = '1_corpus_callosum_dai' if is_dai else '0_normal'
-            patient_dir = os.path.join(output_dir, target_folder, patient_id)
-            # ... (tutaj reszta pętli bez zmian)
-            os.makedirs(patient_dir, exist_ok=True)
-            
-            patient_dicoms = [f for f in zip_files if patient_id in f and f.endswith('.dcm')]
-            
-            for dcm_file in patient_dicoms:
-                file_name = os.path.basename(dcm_file).replace('.dcm', '.png')
-                out_path = os.path.join(patient_dir, file_name)
+        with tqdm(patients, desc="Ekstrakcja RSNA", leave=False) as pbar:
+            for patient_id in pbar:
+                is_dai = df[(df['PatientID'] == patient_id) & (df['Label'] == 1)].shape[0] > 0
+                target_folder = '1_corpus_callosum_dai' if is_dai else '0_normal'
+                patient_dir = os.path.join(output_dir, target_folder, patient_id)
+                os.makedirs(patient_dir, exist_ok=True)
                 
-                if not os.path.exists(out_path):
-                    with z.open(dcm_file) as f:
-                        dicom_data = pydicom.dcmread(f)
-                        img_array = dicom_data.pixel_array.astype(np.float32)
-                        
-                        intercept = getattr(dicom_data, 'RescaleIntercept', 0.0)
-                        slope = getattr(dicom_data, 'RescaleSlope', 1.0)
-                        hu_image = img_array * slope + intercept
-                        
-                        img_norm = np.clip(hu_image, vmin, vmax)
-                        img_norm = ((img_norm - vmin) / (vmax - vmin) * 255.0).astype(np.uint8)
-                        cv.imwrite(out_path, img_norm)
+                patient_dicoms = [f for f in zip_files if patient_id in f and f.endswith('.dcm')]
+                
+                for dcm_file in patient_dicoms:
+                    file_name = os.path.basename(dcm_file).replace('.dcm', '.png')
+                    out_path = os.path.join(patient_dir, file_name)
+                    
+                    if not os.path.exists(out_path):
+                        with z.open(dcm_file) as f:
+                            dicom_data = pydicom.dcmread(f)
+                            img_array = dicom_data.pixel_array.astype(np.float32)
+                            
+                            intercept = getattr(dicom_data, 'RescaleIntercept', 0.0)
+                            slope = getattr(dicom_data, 'RescaleSlope', 1.0)
+                            hu_image = img_array * slope + intercept
+                            
+                            img_norm = np.clip(hu_image, vmin, vmax)
+                            img_norm = ((img_norm - vmin) / (vmax - vmin) * 255.0).astype(np.uint8)
+                            cv.imwrite(out_path, img_norm)
                         
     logger.info(f"Zakończono ekstrakcję do {output_dir}")
     return True
@@ -363,7 +416,7 @@ class VolumetricEfficientNet(nn.Module):
         if imaging_config is None:
             imaging_config = MedicalImagingConfig()
 
-        # 30 plastrów * 3 kanały RGB = 90 kanałów wejściowych
+        # 30 plastrów * 3 kanały BGR = 90 kanałów wejściowych
         input_channels = imaging_config.num_slices * 3
         
         # weights=None ustawia wagi na domyślne losowe inicjalizacje (efekt "szarych/pustych" wag przed trenowaniem)
@@ -421,13 +474,11 @@ def preprocess_raw_ct_to_roi(raw_dir="raw_ct_pngs", out_dir="dataset_efficientne
         df = pd.read_csv(labels_file)
         df.columns = df.columns.str.strip()
         
-        # Uniwersalna obsługa ID pacjenta (RSNA vs CQ500)
         if 'name' in df.columns and 'PatientID' not in df.columns:
             df = df.rename(columns={'name': 'PatientID'})
         elif 'index' in df.columns and 'PatientID' not in df.columns:
             df = df.rename(columns={'index': 'PatientID'})
             
-        # Mapowanie skrótów klinicznych z CQ500 do standardu
         cq500_to_rsna = {
             'EDH': 'epidural', 'SDH': 'subdural', 'SAH': 'subarachnoid',
             'IPH': 'intraparenchymal', 'IVH': 'intraventricular'
@@ -461,86 +512,87 @@ def preprocess_raw_ct_to_roi(raw_dir="raw_ct_pngs", out_dir="dataset_efficientne
         if not available_patients:
             continue
             
-        for patient_id in tqdm(available_patients, desc=f"Wycinanie UNet ({cls_name})", file=sys.stdout):
-            patient_raw_path = images_dir / patient_id
-            patient_out_path = cls_out_dir / patient_id
-            patient_out_path.mkdir(exist_ok=True)
-            
-            for slice_file in os.listdir(patient_raw_path):
-                if not slice_file.lower().endswith(('.png', '.jpg')):
-                    continue
-                    
-                img_path = str(patient_raw_path / slice_file)
-                out_file_path = str(patient_out_path / slice_file)
-
-                img_bgr = cv.imread(img_path, cv.IMREAD_COLOR)
-                if img_bgr is None:
-                    continue
-
-                brain_channel = img_bgr[:, :, 2]
+        with tqdm(available_patients, desc=f"Wycinanie UNet ({cls_name})", leave=False) as pbar:
+            for patient_id in pbar:
+                patient_raw_path = images_dir / patient_id
+                patient_out_path = cls_out_dir / patient_id
+                patient_out_path.mkdir(exist_ok=True)
                 
-                try:
-                    if unet_model is not None:
-                        img_tensor = torch.from_numpy(brain_channel).float().unsqueeze(0).unsqueeze(0).to(DEVICE) / 255.0
-                        
-                        with torch.no_grad():
-                            mask_pred = unet_model(img_tensor)
-                            mask_pred = torch.sigmoid(mask_pred).squeeze().cpu().numpy()
-                        
-                        mask_binary = (mask_pred > 0.5).astype(np.uint8) * 255
-                        contours, _ = cv.findContours(mask_binary, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
-                        
-                        if not contours:
-                            continue
-                            
-                        largest_contour = max(contours, key=cv.contourArea)
-                        x, y, w, h = cv.boundingRect(largest_contour)
-                        
-                        padding = 10
-                        x1 = max(0, x - padding)
-                        y1 = max(0, y - padding)
-                        x2 = min(img_bgr.shape[1], x + w + padding)
-                        y2 = min(img_bgr.shape[0], y + h + padding)
-                    else:
-                        _, thresh = cv.threshold(brain_channel, 5, 255, cv.THRESH_BINARY)
-                        contours, _ = cv.findContours(thresh, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
-                        
-                        if not contours:
-                            continue
-                            
-                        largest_contour = max(contours, key=cv.contourArea)
-                        x, y, w, h = cv.boundingRect(largest_contour)
-                        
-                        if w < 20 or h < 20:
-                            continue
-                        
-                        center_x = x + w // 2
-                        cc_center_y = y + int(h * 0.42)
-                        roi_w, roi_h = int(w * 0.28), int(h * 0.22)
-                        
-                        x1 = max(0, center_x - roi_w // 2)
-                        y1 = max(0, cc_center_y - roi_h // 2)
-                        x2 = min(img_bgr.shape[1], center_x + roi_w // 2)
-                        y2 = min(img_bgr.shape[0], cc_center_y + roi_h // 2)
-                
-                    cc_crop_bgr = img_bgr[y1:y2, x1:x2]
-                    
-                    if cc_crop_bgr.shape[0] < 5 or cc_crop_bgr.shape[1] < 5:
+                for slice_file in os.listdir(patient_raw_path):
+                    if not slice_file.lower().endswith(('.png', '.jpg')):
                         continue
                         
-                    efficientnet_ready = cv.resize(cc_crop_bgr, (224, 224), interpolation=cv.INTER_CUBIC)
-                    cv.imwrite(out_file_path, efficientnet_ready)
-                    processed_count += 1
-                except cv.error as cve:
-                    logger.warning(f"Błąd OpenCV podczas wycinania ROI dla pliku {slice_file}: {cve}")
-                except RuntimeError as re:
-                    logger.error(f"Błąd operacji tensorowej/GPU podczas ekstrakcji ROI: {re}")
-                    if "out of memory" in str(re).lower():
-                        if DEVICE.type == 'cuda':
-                            torch.cuda.empty_cache()
-                        logger.warning("Zwolniono pamięć GPU po błędzie OOM.")
-                except Exception as inner_e:
-                    logger.debug(f"Pominięto plaster z powodu nieoczekiwanego błędu: {inner_e}")
+                    img_path = str(patient_raw_path / slice_file)
+                    out_file_path = str(patient_out_path / slice_file)
+
+                    img_bgr = cv.imread(img_path, cv.IMREAD_COLOR)
+                    if img_bgr is None:
+                        continue
+
+                    brain_channel = img_bgr[:, :, 2]
+                    
+                    try:
+                        if unet_model is not None:
+                            img_tensor = torch.from_numpy(brain_channel).float().unsqueeze(0).unsqueeze(0).to(DEVICE) / 255.0
+                            
+                            with torch.no_grad():
+                                mask_pred = unet_model(img_tensor)
+                                mask_pred = torch.sigmoid(mask_pred).squeeze().cpu().numpy()
+                            
+                            mask_binary = (mask_pred > 0.5).astype(np.uint8) * 255
+                            contours, _ = cv.findContours(mask_binary, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
+                            
+                            if not contours:
+                                continue
+                                
+                            largest_contour = max(contours, key=cv.contourArea)
+                            x, y, w, h = cv.boundingRect(largest_contour)
+                            
+                            padding = 10
+                            x1 = max(0, x - padding)
+                            y1 = max(0, y - padding)
+                            x2 = min(img_bgr.shape[1], x + w + padding)
+                            y2 = min(img_bgr.shape[0], y + h + padding)
+                        else:
+                            _, thresh = cv.threshold(brain_channel, 5, 255, cv.THRESH_BINARY)
+                            contours, _ = cv.findContours(thresh, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
+                            
+                            if not contours:
+                                continue
+                                
+                            largest_contour = max(contours, key=cv.contourArea)
+                            x, y, w, h = cv.boundingRect(largest_contour)
+                            
+                            if w < 20 or h < 20:
+                                continue
+                            
+                            center_x = x + w // 2
+                            cc_center_y = y + int(h * 0.42)
+                            roi_w, roi_h = int(w * 0.28), int(h * 0.22)
+                            
+                            x1 = max(0, center_x - roi_w // 2)
+                            y1 = max(0, cc_center_y - roi_h // 2)
+                            x2 = min(img_bgr.shape[1], center_x + roi_w // 2)
+                            y2 = min(img_bgr.shape[0], cc_center_y + roi_h // 2)
+                    
+                        cc_crop_bgr = img_bgr[y1:y2, x1:x2]
+                        
+                        if cc_crop_bgr.shape[0] < 5 or cc_crop_bgr.shape[1] < 5:
+                            continue
+                            
+                        efficientnet_ready = cv.resize(cc_crop_bgr, (224, 224), interpolation=cv.INTER_CUBIC)
+                        cv.imwrite(out_file_path, efficientnet_ready)
+                        processed_count += 1
+                    except cv.error as cve:
+                        logger.debug(f"Błąd OpenCV podczas wycinania ROI dla pliku {slice_file}: {cve}")
+                    except RuntimeError as re:
+                        logger.error(f"Błąd operacji tensorowej/GPU podczas ekstrakcji ROI: {re}")
+                        if "out of memory" in str(re).lower():
+                            if DEVICE.type == 'cuda':
+                                torch.cuda.empty_cache()
+                            logger.warning("Zwolniono pamięć GPU po błędzie OOM.")
+                    except Exception as inner_e:
+                        logger.debug(f"Pominięto plaster z powodu nieoczekiwanego błędu: {inner_e}")
                     
     logger.info(f"Wycięto i przetworzono {processed_count} trójkanałowych przekrojów Ciała Modzelowatego.")
     return processed_count > 0
@@ -567,7 +619,7 @@ class RLAutoAugmentAgent(nn.Module):
     """ Agent steruje polityką zniekształceń, optymalizując dwie sprzeczne nagrody:
         1. Task Reward: Poprawa F1Score zmusza do trudnych augmentacji, przy jednoczesnym pozostawieniu modelowi szans podjęcia dobrej decyzji.
         2. Struct Reward: Zachowanie anatomii, które zapobiega niszczeniu skanów i umożliwia tworzenie augmentacji skoncentrowanych w okolicach aksonów. """
-    def __init__(self, state_dim=2, action_dim=5, lr=1e-3, struct_lambda=0.2):
+    def __init__(self, state_dim=3, action_dim=5, lr=1e-3, struct_lambda=0.2):
         super().__init__()
         self.struct_lambda = struct_lambda  # Waga określająca jak bardzo chronimy biologię
 
@@ -751,7 +803,11 @@ class CTCapsuleDataset(Dataset):
         
         for i, slice_file in enumerate(slices):
             img_path = os.path.join(patient_path, slice_file)
-            img = Image.open(img_path).convert('RGB')
+            
+            with Image.open(img_path) as img:
+                img_rgb = img.convert('RGB')
+            img_bgr_array = np.array(img_rgb)[:, :, ::-1].copy()
+            img = Image.fromarray(img_bgr_array)
             
             torch.manual_seed(volumetric_seed)
             volume_tensor[i] = self.transform(img)
@@ -762,9 +818,7 @@ class CTCapsuleDataset(Dataset):
 
 
 class DynamicErrorMarginLoss(nn.Module):
-    """ Funkcja straty oparta na dynamicznym skupianiu na błędach.
-        Zastępuje sztywne wagi klas mechanizmem, w którym siła kary rośnie 
-        proporcjonalnie do wielkości pomyłki modelu. """
+    """ Funkcja straty oparta na dynamicznym skupianiu na błędach z poprawną obsługą wektora pos_weight. """
     def __init__(self, m_plus=0.9, m_minus=0.1, lambda_val=0.5, base_gamma=2.0, pos_weight=None):
         super(DynamicErrorMarginLoss, self).__init__()
         self.m_plus = m_plus
@@ -777,58 +831,48 @@ class DynamicErrorMarginLoss(nn.Module):
         capsule_probs = torch.clamp(capsule_probs, min=1e-7, max=1.0 - 1e-7)
         labels_one_hot = func.one_hot(labels.to(torch.int64), num_classes=2).float()
         
-        # Klasyczny Margin Loss Hintona dla struktur wektorowych
         present_error_loss = func.relu(self.m_plus - capsule_probs) ** 2
         absent_error_loss = func.relu(capsule_probs - self.m_minus) ** 2
         base_loss = labels_one_hot * present_error_loss + self.lambda_val * (1.0 - labels_one_hot) * absent_error_loss
 
-        # Uwzględnienie pos_weight, jeśli został przekazany
         if self.pos_weight is not None:
             pw = self.pos_weight.to(capsule_probs.device)
-            base_loss = base_loss * (labels_one_hot * pw + (1.0 - labels_one_hot))
+            if pw.dim() == 1 and pw.shape[0] == 2:
+                base_loss = base_loss * pw.unsqueeze(0)
+            else:
+                base_loss = base_loss * pw
         
-        # Określenie pewności sieci co do prawdziwej etykiety
         p_t = labels_one_hot * capsule_probs + (1.0 - labels_one_hot) * (1.0 - capsule_probs)
-        
-        # Skala błędu: im gorzej radzi sobie model, tym większy błąd
         error_magnitude = (1.0 - p_t)
         
-        # Dynamiczny Focal Gamma: im większa pomyłka, tym silniej nieliniowo rośnie kara
         dynamic_gamma = self.base_gamma + (error_magnitude * 2.0)
-        
-        # Automatyczne, adaptacyjne skupienie wyłącznie na pomyłkach i trudnych przypadkach
         focal_weight = error_magnitude ** dynamic_gamma
         loss = base_loss * focal_weight
         
-        return loss.sum(dim=1).mean()
-    
+        return loss.sum(dim=1).mean() 
+
 
 def objective(trial): 
     dataset_path = os.path.join(BASE_DIR, 'Data', 'dataset_efficientnet')
     
     imaging_config = MedicalImagingConfig()
     
-    # Hiperparametry do przetestowania przez Optunę
     lr = trial.suggest_float('lr', 1e-5, 1e-3, log=True)
     routing_iters = trial.suggest_int('routing_iters', 2, 4)
     batch_size = trial.suggest_categorical('batch_size', [2, 4])
     
-    # Używamy datasetu treningowego z augmentacjami
     dataset = CTCapsuleDataset(root_dir=dataset_path, imaging_config=imaging_config, is_train=True)
     train_size = int(0.8 * len(dataset))
     val_size = len(dataset) - train_size
     train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
 
-    # Zastąpienie ręcznego pin_memory gotowymi stałymi globalnymi
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, **LOADER_KWARGS)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, **LOADER_KWARGS)
     
-    # Przekazujemy imaging_config zamiast num_slices
     model = VolumetricEfficientNet(imaging_config=imaging_config, backbone='efficientnet')
     model.digit_caps.routing_iters = routing_iters
     model.to(DEVICE)
 
-    # Aplikujemy regularyzację, żeby walczyć z przeuczeniem na małym zbiorze i wagi, żeby karać mocniej za klasę mniejszościową
     criterion = DynamicErrorMarginLoss(base_gamma=2.0)
     optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=1e-2)
 
@@ -837,52 +881,47 @@ def objective(trial):
     num_epochs = 5
     best_val_loss = float('inf')
     
-    for epoch in range(num_epochs):
-        model.train()
-        
-        # Pasek postępu treningu
-        train_pbar = tqdm(train_loader, desc=f"Optuna Trial | Epoka [{epoch+1}/{num_epochs}]", leave=False, file=sys.stdout, mininterval=2.0)
-        for volumes, labels in train_pbar:
-            volumes, labels = volumes.to(DEVICE, non_blocking=True), labels.to(DEVICE, non_blocking=True)
-            optimizer.zero_grad(set_to_none=True)
+    with tqdm(range(num_epochs), desc=f"Optuna Trial {trial.number}") as optuna_pbar:
+        for epoch in optuna_pbar:
+            model.train()
             
-            autocast_context = torch.amp.autocast(device_type='cuda') if DEVICE.type == 'cuda' else nullcontext()
-            with autocast_context:
-                capsule_probs = model(volumes)
-                loss = criterion(capsule_probs, labels)
-                
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-            
-            # Aktualizacja paska o aktualną stratę
-            train_pbar.set_postfix({'loss': f"{loss.item():.4f}"})
-            
-        model.eval()
-        val_loss = 0.0
-        
-        # Pasek postępu walidacji
-        val_pbar = tqdm(val_loader, desc="Optuna Walidacja", leave=False, file=sys.stdout, mininterval=2.0)
-        with torch.no_grad():
-            for volumes, labels in val_pbar:
+            for volumes, labels in train_loader:
                 volumes, labels = volumes.to(DEVICE, non_blocking=True), labels.to(DEVICE, non_blocking=True)
-                with torch.amp.autocast(device_type=DEVICE.type, enabled=(DEVICE.type == 'cuda')):
+                optimizer.zero_grad(set_to_none=True)
+                
+                autocast_context = torch.amp.autocast(device_type='cuda') if DEVICE.type == 'cuda' else nullcontext()
+                with autocast_context:
                     capsule_probs = model(volumes)
                     loss = criterion(capsule_probs, labels)
-                val_loss += loss.item()
+                    
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
                 
-        val_loss /= len(val_loader)
-        
-        trial.report(val_loss, epoch)
-        if trial.should_prune():
-            # Zabezpieczenie przed prunowanymi trialami
-            del model, optimizer, train_loader, val_loader
-            if DEVICE.type == 'cuda': torch.cuda.empty_cache()
-            raise optuna.exceptions.TrialPruned()
+            model.eval()
+            val_loss = 0.0
             
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-        
+            with torch.no_grad():
+                for volumes, labels in val_loader:
+                    volumes, labels = volumes.to(DEVICE, non_blocking=True), labels.to(DEVICE, non_blocking=True)
+                    with torch.amp.autocast(device_type=DEVICE.type, enabled=(DEVICE.type == 'cuda')):
+                        capsule_probs = model(volumes)
+                        loss = criterion(capsule_probs, labels)
+                    val_loss += loss.item()
+                    
+            val_loss /= len(val_loader)
+            
+            optuna_pbar.set_postfix({'Val Loss': f"{val_loss:.4f}"})
+            
+            trial.report(val_loss, epoch)
+            if trial.should_prune():
+                del model, optimizer, train_loader, val_loader
+                if DEVICE.type == 'cuda': torch.cuda.empty_cache()
+                raise optuna.exceptions.TrialPruned()
+                
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+            
     return best_val_loss
 
 
@@ -1012,27 +1051,31 @@ def train_unet_model(raw_dir=None, epochs=3):
     criterion = nn.BCEWithLogitsLoss()
 
     unet.train()
-    for epoch in range(epochs):
-        epoch_loss = 0.0
-        epoch_dice = 0.0
-        unet_pbar = tqdm(dataloader, desc=f"UNet Epoka [{epoch+1}/{epochs}]", leave=False, file=sys.stdout)
-        for imgs, masks in unet_pbar:
-            imgs, masks = imgs.to(DEVICE), masks.to(DEVICE)
-            optimizer.zero_grad()
-            preds = unet(imgs)
-            loss = criterion(preds, masks)
-            loss.backward()
-            optimizer.step()
-            epoch_loss += loss.item()
+    
+    with tqdm(range(epochs), desc="Trening UNet") as unet_pbar:
+        for epoch in unet_pbar:
+            epoch_loss = 0.0
+            epoch_dice = 0.0
             
-            # Obliczanie Dice Score dla batcha
-            preds_bin = (torch.sigmoid(preds) > 0.5).float()
-            intersection = (preds_bin * masks).sum(dim=(2, 3))
-            union = preds_bin.sum(dim=(2, 3)) + masks.sum(dim=(2, 3))
-            dice = (2. * intersection + 1e-5) / (union + 1e-5)
-            epoch_dice += dice.mean().item()
-            
-        logger.info(f"UNet Epoka [{epoch+1}/{epochs}] | Strata: {epoch_loss/len(dataloader):.4f} | Dice Score: {epoch_dice/len(dataloader):.3f}")
+            for imgs, masks in dataloader:
+                imgs, masks = imgs.to(DEVICE), masks.to(DEVICE)
+                optimizer.zero_grad()
+                preds = unet(imgs)
+                loss = criterion(preds, masks)
+                loss.backward()
+                optimizer.step()
+                epoch_loss += loss.item()
+                
+                preds_bin = (torch.sigmoid(preds) > 0.5).float()
+                intersection = (preds_bin * masks).sum(dim=(2, 3))
+                union = preds_bin.sum(dim=(2, 3)) + masks.sum(dim=(2, 3))
+                dice = (2. * intersection + 1e-5) / (union + 1e-5)
+                epoch_dice += dice.mean().item()
+                
+            unet_pbar.set_postfix({
+                'Strata': f"{epoch_loss/len(dataloader):.4f}", 
+                'Dice': f"{epoch_dice/len(dataloader):.3f}"
+            })
 
     os.makedirs(os.path.join(BASE_DIR, 'output_data', 'Models'), exist_ok=True)
     torch.save(unet.state_dict(), model_path)
@@ -1132,7 +1175,6 @@ def _prepare_datasets_and_unet(raw_ct_path: str, dataset_path: str, raw_ft_path:
     return unet_model
 
 
-
 def _run_cross_validation_training(train_raw_dataset, val_raw_dataset, unet_model, best_params: dict, path_main: str):
     """ Zarządza procesem walidacji krzyżowej (StratifiedKFold), treningiem wstępnym RL i głównym treningiem EfficientNet. """
     dataset_len = len(train_raw_dataset)
@@ -1149,7 +1191,7 @@ def _run_cross_validation_training(train_raw_dataset, val_raw_dataset, unet_mode
     best_val_f1 = 0.0
     
     for fold, (train_indices, val_indices) in enumerate(skf.split(np.zeros(dataset_len), all_labels)):
-        logger.info(f"Fold {fold+1}/{n_splits}")
+        logger.info(f"Rozpoczęto Fold {fold+1}/{n_splits}")
         
         train_dataset = torch.utils.data.Subset(train_raw_dataset, train_indices)
         val_dataset = torch.utils.data.Subset(val_raw_dataset, val_indices)
@@ -1181,36 +1223,22 @@ def _run_cross_validation_training(train_raw_dataset, val_raw_dataset, unet_mode
         model.digit_caps.routing_iters = routing_iters
         model = model.to(DEVICE)
 
-        # Kompilacja modelu PyTorch 2.x dla radykalnego przyspieszenia epok
         if hasattr(torch, 'compile') and DEVICE.type == 'cuda':
             try:
                 model = torch.compile(model, mode="reduce-overhead")
-                logger.info("Model EfficientNet został pomyślnie skompilowany przy użyciu torch.compile().")
-            except RuntimeError as e:
-                logger.warning(
-                    f"Kompilacja modelu nie powiodła się (RuntimeError: {e}). "
-                    "Model będzie działał w standardowym trybie."
-                )
-            except Exception as e:
-                logger.warning(
-                    f"Wystąpił nieoczekiwany błąd podczas próby kompilacji: {e}", 
-                    exc_info=True
-                )
+            except Exception:
+                pass
 
         neg_count = max(1, class_counts[0])
         pos_count = max(1, class_counts[1])
         raw_w_pos = neg_count / pos_count
         smooth_w_pos = float(np.clip(np.log1p(raw_w_pos) + 1.0, 1.0, 10.0))
         weights = torch.tensor([1.0, smooth_w_pos], dtype=torch.float32).to(DEVICE)
-        logger.info(f"Wygładzone wagi klas EfficientNet: [1.0, {smooth_w_pos:.2f}]")
 
         criterion = DynamicErrorMarginLoss(base_gamma=1.5)
-
-        # Inicjalizacja Agenta RL do polityki augmentacji
         rl_agent = RLAutoAugmentAgent(state_dim=3, action_dim=5, lr=1e-3).to(DEVICE)
         previous_f1, previous_struct_score, previous_sym_score = 0.0, 1.0, 1.0
 
-        # Użycie zoptymalizowanego optymalizatora z flagą fused=True dla szybszego updatowania wag
         optimizer = optim.Adam(model.parameters(), lr=main_lr, weight_decay=1e-2, fused=(DEVICE.type == 'cuda'))
         scaler = get_scaler()
 
@@ -1232,53 +1260,54 @@ def _run_cross_validation_training(train_raw_dataset, val_raw_dataset, unet_mode
             rl_probs = rl_agent.select_augmentations(current_loss=previous_f1, struct_score=previous_struct_score, symmetry_score=previous_sym_score)
             train_raw_dataset.update_rl_policy(*rl_probs)
 
-            # Trening epoki
             model.train()
             train_loss = 0.0
-            train_pbar = tqdm(train_loader, desc=f"Fold [{fold+1}] Trening [{epoch+1}/{main_epochs}]", leave=False, file=sys.stdout, mininterval=2.0)
-            for volumes, labels in train_pbar:
-                volumes, labels = volumes.to(DEVICE, non_blocking=True), labels.to(DEVICE, non_blocking=True)
-                optimizer.zero_grad(set_to_none=True)
-                
-                with torch.amp.autocast(device_type=DEVICE.type, enabled=(DEVICE.type == 'cuda')):
-                    capsule_probs = model(volumes)
-                    loss = criterion(capsule_probs, labels)
+            
+            with tqdm(train_loader, desc=f"F[{fold+1}] E[{epoch+1}/{main_epochs}] Train", leave=False) as train_pbar:
+                for volumes, labels in train_pbar:
+                    volumes, labels = volumes.to(DEVICE, non_blocking=True), labels.to(DEVICE, non_blocking=True)
+                    optimizer.zero_grad(set_to_none=True)
                     
-                scaler.scale(loss).backward()
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                scaler.step(optimizer)
-                scaler.update()
-                train_loss += loss.item()
-                train_pbar.set_postfix({'loss': f"{loss.item():.4f}"})
+                    with torch.amp.autocast(device_type=DEVICE.type, enabled=(DEVICE.type == 'cuda')):
+                        capsule_probs = model(volumes)
+                        loss = criterion(capsule_probs, labels)
+                        
+                    scaler.scale(loss).backward()
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    scaler.step(optimizer)
+                    scaler.update()
+                    
+                    train_loss += loss.item()
+                    train_pbar.set_postfix({'loss': f"{loss.item():.4f}"})
                 
             train_loss /= len(train_loader)
             scheduler.step()
             
-            # Walidacja
             model.eval()
             val_loss, val_epoch_labels, val_epoch_probs = 0.0, [], []
             unet_confidences, symmetry_scores = [], []
             
-            val_pbar = tqdm(val_loader, desc=f"Fold [{fold+1}] Walidacja OIT [{epoch+1}/{main_epochs}]", leave=False, file=sys.stdout, mininterval=2.0)
-            with torch.no_grad():
-                for volumes, labels in val_pbar:
-                    volumes, labels = volumes.to(DEVICE, non_blocking=True), labels.to(DEVICE, non_blocking=True)
-                    autocast_context = torch.amp.autocast(device_type='cuda') if DEVICE.type == 'cuda' else nullcontext()
-                    with autocast_context:
-                        capsule_probs = model(volumes)
-                        loss = criterion(capsule_probs, labels)
-                        
-                        B, S, C, H, W = volumes.shape
-                        brain_slices = volumes[:, :, 2:3, :, :].contiguous().view(B * S, 1, H, W)
-                        mask_pred = torch.sigmoid(unet_model(brain_slices))
-                        unet_confidences.append(mask_pred.mean().item())
-                        
-                        symmetry_scores.append(calculate_hemispheric_symmetry(volumes))
-                        
-                    val_loss += loss.item()
-                    val_epoch_labels.extend(labels.cpu().numpy())
-                    val_epoch_probs.extend(capsule_probs[:, 1].cpu().numpy())
+            with tqdm(val_loader, desc=f"F[{fold+1}] E[{epoch+1}/{main_epochs}] Val", leave=False) as val_pbar:
+                with torch.no_grad():
+                    for volumes, labels in val_pbar:
+                        volumes, labels = volumes.to(DEVICE, non_blocking=True), labels.to(DEVICE, non_blocking=True)
+                        autocast_context = torch.amp.autocast(device_type='cuda') if DEVICE.type == 'cuda' else nullcontext()
+                        with autocast_context:
+                            capsule_probs = model(volumes)
+                            loss = criterion(capsule_probs, labels)
+                            
+                            B, S, C, H, W = volumes.shape
+                            brain_slices = volumes[:, :, 2:3, :, :].contiguous().view(B * S, 1, H, W)
+                            mask_pred = torch.sigmoid(unet_model(brain_slices))
+                            unet_confidences.append(mask_pred.mean().item())
+                            
+                            symmetry_scores.append(calculate_hemispheric_symmetry(volumes))
+                            
+                        val_loss += loss.item()
+                        val_pbar.set_postfix({'loss': f"{loss.item():.4f}"})
+                        val_epoch_labels.extend(labels.cpu().numpy())
+                        val_epoch_probs.extend(capsule_probs[:, 1].cpu().numpy())
                     
             val_loss /= len(val_loader)
 
@@ -1296,10 +1325,7 @@ def _run_cross_validation_training(train_raw_dataset, val_raw_dataset, unet_mode
                 else:
                     f1_scores = (2 * precisions[:-1] * recalls[:-1]) / (precisions[:-1] + recalls[:-1] + 1e-10)
                     best_threshold = float(np.clip(thresholds[np.argmax(f1_scores)], 0.1, 0.9))
-            except ValueError:
-                best_threshold = float(np.median(all_probs_np)) if len(all_probs_np) > 0 else 0.5
-            except Exception as e:
-                logger.warning(f"Wystąpił błąd podczas obliczania najlepszego progu: {e}. Używam mediany jako progu.")
+            except Exception:
                 best_threshold = float(np.median(all_probs_np)) if len(all_probs_np) > 0 else 0.5
                 
             all_preds = (all_probs_np >= best_threshold).astype(int)
@@ -1310,12 +1336,15 @@ def _run_cross_validation_training(train_raw_dataset, val_raw_dataset, unet_mode
                 
             if DEVICE.type == 'cuda': torch.cuda.empty_cache()
 
+            logger.info(f"Fold [{fold+1}/{n_splits}] Epoka [{epoch+1}/{main_epochs}] | Próg: {best_threshold:.2f} | "
+                        f"Loss T/V: {train_loss:.4f}/{val_loss:.4f} | "
+                        f"AUC: {auc:.3f} | F1: {f1:.3f} | Prec: {precision:.1f}% | Sens: {recall:.1f}%")
+
             if f1 > best_val_f1:
                 best_val_f1 = f1
                 os.makedirs(os.path.join(BASE_DIR, 'output_data', 'Models'), exist_ok=True)
-                # Zapisujemy oryginalny stan modelu (odwijając ewentualną kompilację `_orig_mod`)
                 torch.save(model._orig_mod.state_dict() if hasattr(model, '_orig_mod') else model.state_dict(), path_main)
-                logger.info(f" Nowy globalny najlepszy model MAIN OIT zapisany (F1: {f1:.3f})!")
+                logger.info(f" ---> Zapisano nowy najlepszy model MAIN (F1: {f1:.3f})")
                 patience_counter = 0 
             else:
                 patience_counter += 1
@@ -1323,15 +1352,15 @@ def _run_cross_validation_training(train_raw_dataset, val_raw_dataset, unet_mode
             if patience_counter >= patience:
                 current_lr = optimizer.param_groups[0]['lr']
                 if current_lr > 1e-7:
-                    logger.info(f" Redukuję stopę uczenia o połowę i kontynuuję Fold {fold+1}.")
+                    logger.info(f" ---> Redukcja LR. Kontynuacja Fold {fold+1}.")
                     for param_group in optimizer.param_groups: param_group['lr'] *= 0.5
                     patience_counter = 0
                 else:
-                    logger.info(f" Przerywam Fold {fold+1}.")
+                    logger.info(f" ---> Early stopping. Przerywam Fold {fold+1}.")
                     break
-            
-            logger.info(f"Fold [{fold+1}] Epoka [{epoch+1}/{main_epochs}] | Próg OIT: {best_threshold:.2f} | Strata treningowa: {train_loss:.4f} | Strata walidacyjna: {val_loss:.4f} | "
-                f"AUC: {auc:.3f} | F1: {f1:.3f} | Precyzja: {precision:.1f}% | Czułość: {recall:.1f}%")
+
+            task_reward = f1 - previous_f1
+            rl_agent.update(task_reward=task_reward, struct_reward=current_struct_score)
 
             previous_f1 = f1
             previous_struct_score = current_struct_score
@@ -1343,7 +1372,6 @@ def _run_fine_tune_phase(path_main: str, path_fine: str, raw_ct_path: str, raw_f
     fine_epochs = 6
     fine_lr = 1e-5
     logger.info(f"Rozpoczynam złączony Fine Tuning (UNet + EfficientNet) przez {fine_epochs} epok.")
-    scaler = get_scaler()
 
     gc.collect()
     if DEVICE.type == 'cuda': torch.cuda.empty_cache()
@@ -1365,62 +1393,26 @@ def _run_fine_tune_phase(path_main: str, path_fine: str, raw_ct_path: str, raw_f
     
     unet_model = train_unet_model(raw_dir=raw_ct_path)
     
-    model.train()
-    unet_model.train()
-
     optimizer_joint = optim.Adam(list(model.parameters()) + list(unet_model.parameters()), lr=fine_lr, weight_decay=1e-2)
-
     scaler = get_scaler()
     
     neg_ft = train_raw_dataset.labels.count(0)
     pos_ft = train_raw_dataset.labels.count(1)
     pos_weight_val = neg_ft / max(1, pos_ft)
-    criterion_ft = DynamicErrorMarginLoss(base_gamma=2.0, pos_weight=torch.tensor([pos_weight_val]))
+    criterion_ft = DynamicErrorMarginLoss(base_gamma=2.0, pos_weight=torch.tensor([1.0, pos_weight_val]))
     
     best_val_f2 = 0.0
-
     optimizer_joint.zero_grad()
+
     for epoch in range(fine_epochs):
         model.train()
         unet_model.train()
         train_loss = 0.0
         
-        fine_pbar = tqdm(fine_train_loader, desc=f"Złączony Fine Tune [{epoch+1}/{fine_epochs}]", leave=False, file=sys.stdout, mininterval=2.0)
-        for i, (volumes, labels) in enumerate(fine_pbar):
-            volumes, labels = volumes.to(DEVICE), labels.to(DEVICE)
-            
-            with torch.amp.autocast(device_type=DEVICE.type, enabled=(DEVICE.type == 'cuda')):
-                B, S, C, H, W = volumes.shape
-                brain_slices = volumes[:, :, 2:3, :, :].contiguous().view(B * S, 1, H, W)
-                mask_pred = torch.sigmoid(unet_model(brain_slices)).view(B, S, 1, H, W)
-                processed_volumes = volumes * mask_pred
-                
-                capsule_probs = model(processed_volumes)
-                loss = criterion_ft(capsule_probs, labels)
-                loss = loss / accumulation_steps
-                
-            scaler.scale(loss).backward()
-            if (i + 1) % accumulation_steps == 0 or (i + 1) == len(fine_train_loader):
-                scaler.unscale_(optimizer_joint)
-                torch.nn.utils.clip_grad_norm_(list(model.parameters()) + list(unet_model.parameters()), max_norm=1.0)
-                scaler.step(optimizer_joint)
-                scaler.update()
-                optimizer_joint.zero_grad()
-
-        real_loss = loss.item() * accumulation_steps
-        train_loss += real_loss
-        fine_pbar.set_postfix({'loss': f"{real_loss:.4f}"})
-        
-        # Walidacja Fine Tune
-        model.eval()
-        unet_model.eval()
-        val_loss = 0.0
-        all_labels_ft, all_probs_ft = [], []
-        
-        val_ft_pbar = tqdm(val_loader, desc=f"Walidacja OIT FT [{epoch+1}/{fine_epochs}]", leave=False, file=sys.stdout, mininterval=2.0)
-        with torch.no_grad():
-            for volumes, labels in val_ft_pbar:
+        with tqdm(fine_train_loader, desc=f"FT E[{epoch+1}/{fine_epochs}] Train", leave=False) as train_pbar:
+            for i, (volumes, labels) in enumerate(train_pbar):
                 volumes, labels = volumes.to(DEVICE), labels.to(DEVICE)
+                
                 with torch.amp.autocast(device_type=DEVICE.type, enabled=(DEVICE.type == 'cuda')):
                     B, S, C, H, W = volumes.shape
                     brain_slices = volumes[:, :, 2:3, :, :].contiguous().view(B * S, 1, H, W)
@@ -1429,10 +1421,44 @@ def _run_fine_tune_phase(path_main: str, path_fine: str, raw_ct_path: str, raw_f
                     
                     capsule_probs = model(processed_volumes)
                     loss = criterion_ft(capsule_probs, labels)
+                    loss = loss / accumulation_steps
                     
-                val_loss += loss.item()
-                all_labels_ft.extend(labels.cpu().numpy())
-                all_probs_ft.extend(capsule_probs[:, 1].cpu().numpy())
+                scaler.scale(loss).backward()
+                if (i + 1) % accumulation_steps == 0 or (i + 1) == len(fine_train_loader):
+                    scaler.unscale_(optimizer_joint)
+                    torch.nn.utils.clip_grad_norm_(list(model.parameters()) + list(unet_model.parameters()), max_norm=1.0)
+                    scaler.step(optimizer_joint)
+                    scaler.update()
+                    optimizer_joint.zero_grad()
+
+                real_loss = loss.item() * accumulation_steps
+                train_loss += real_loss
+                train_pbar.set_postfix({'loss': f"{real_loss:.4f}"})
+            
+        train_loss /= max(1, len(fine_train_loader))
+        
+        model.eval()
+        unet_model.eval()
+        val_loss = 0.0
+        all_labels_ft, all_probs_ft = [], []
+        
+        with tqdm(val_loader, desc=f"FT E[{epoch+1}/{fine_epochs}] Val", leave=False) as val_pbar:
+            with torch.no_grad():
+                for volumes, labels in val_pbar:
+                    volumes, labels = volumes.to(DEVICE), labels.to(DEVICE)
+                    with torch.amp.autocast(device_type=DEVICE.type, enabled=(DEVICE.type == 'cuda')):
+                        B, S, C, H, W = volumes.shape
+                        brain_slices = volumes[:, :, 2:3, :, :].contiguous().view(B * S, 1, H, W)
+                        mask_pred = torch.sigmoid(unet_model(brain_slices)).view(B, S, 1, H, W)
+                        processed_volumes = volumes * mask_pred
+                        
+                        capsule_probs = model(processed_volumes)
+                        loss = criterion_ft(capsule_probs, labels)
+                        
+                    val_loss += loss.item()
+                    val_pbar.set_postfix({'loss': f"{loss.item():.4f}"})
+                    all_labels_ft.extend(labels.cpu().numpy())
+                    all_probs_ft.extend(capsule_probs[:, 1].cpu().numpy())
                 
         val_loss /= max(1, len(val_loader))
         
@@ -1446,10 +1472,7 @@ def _run_fine_tune_phase(path_main: str, path_fine: str, raw_ct_path: str, raw_f
                 else:
                     f2_scores = (5 * precisions[:-1] * recalls[:-1]) / (4 * precisions[:-1] + recalls[:-1] + 1e-10)
                     best_threshold = float(np.clip(thresholds[np.argmax(f2_scores)], 0.1, 0.9))
-            except ValueError:
-                best_threshold = float(np.median(all_probs_np)) if len(all_probs_np) > 0 else 0.5
-            except Exception as e:
-                logger.warning(f"Wystąpił błąd podczas obliczania najlepszego progu w Fine Tune: {e}. Używam mediany jako progu.")
+            except Exception:
                 best_threshold = float(np.median(all_probs_np)) if len(all_probs_np) > 0 else 0.5
                 
             all_preds = (all_probs_np >= best_threshold).astype(int)
@@ -1463,23 +1486,29 @@ def _run_fine_tune_phase(path_main: str, path_fine: str, raw_ct_path: str, raw_f
         
         if DEVICE.type == 'cuda': torch.cuda.empty_cache()
 
-        logger.info(f'Złączony Fine Tune Epoka [{epoch+1}/{fine_epochs}] | Próg OIT: {best_threshold:.2f} | Strata treningowa: {train_loss:.4f} | Strata walidacyjna: {val_loss:.4f} | '
-            f'Dokładność: {accuracy:.1f}% | AUC: {auc:.3f} | F2 (Macro): {f2:.3f} | Precyzja: {precision:.1f}% | Czułość: {recall:.1f}%')
+        logger.info(f'FT Epoka [{epoch+1}/{fine_epochs}] | Próg: {best_threshold:.2f} | '
+                    f'Loss T/V: {train_loss:.4f}/{val_loss:.4f} | '
+                    f'BAcc: {accuracy:.1f}% | AUC: {auc:.3f} | F2: {f2:.3f} | Prec: {precision:.1f}% | Sens: {recall:.1f}%')
         
         if f2 > best_val_f2:
             best_val_f2 = f2
             torch.save(model.state_dict(), path_fine)
             torch.save(unet_model.state_dict(), os.path.join(BASE_DIR, 'output_data', 'Models', 'unet_corpus_callosum_finetune.pth'))
-            logger.info(f" Nowe najlepsze złączone wagi kaskady zapisane! (F2: {f2:.3f})")
+            logger.info(f" ---> Zapisano nowe najlepsze złączone wagi kaskady (F2: {f2:.3f})")
 
     # Po zakończeniu fine tuningu i zapisaniu wag modeli, trenujemy Agenta RL od polityki augmentacji
     val_loader = DataLoader(val_raw_dataset, batch_size=4, shuffle=False)
     
-    model_main = VolumetricEfficientNet(imaging_config=MedicalImagingConfig()).to(DEVICE)
-    model_main.load_state_dict(torch.load(path_main, map_location=DEVICE))
-    
-    model_fine = VolumetricEfficientNet(imaging_config=MedicalImagingConfig()).to(DEVICE)
-    model_fine.load_state_dict(torch.load(path_fine, map_location=DEVICE))
+    if os.path.exists(path_main) and os.path.exists(path_fine):
+        model_main = VolumetricEfficientNet(imaging_config=MedicalImagingConfig()).to(DEVICE)
+        model_main.load_state_dict(torch.load(path_main, map_location=DEVICE))
+        
+        model_fine = VolumetricEfficientNet(imaging_config=MedicalImagingConfig()).to(DEVICE)
+        model_fine.load_state_dict(torch.load(path_fine, map_location=DEVICE))
+        
+        train_routing_agent(model_main, model_fine, val_loader, thresh_fine=0.50, thresh_main=0.55, epochs=15)
+    else:
+        logger.warning("Brak kompletnych wag Main/Fine na dysku. Pomijam osobny trening Agenta RL.")
     
     # Trening agenta na zbiorze walidacyjnym
     train_routing_agent(model_main, model_fine, val_loader, thresh_fine=0.50, thresh_main=0.55, epochs=15)
@@ -1529,7 +1558,7 @@ def _run_fine_tune_phase(path_main: str, path_fine: str, raw_ct_path: str, raw_f
 
 def train_efficientnet():
     """ Główny orkiestrator kaskady EfficientNet (Optuna -> K-Fold z RL -> Fine Tune). """
-    raw_ct_path = os.path.join(BASE_DIR, 'Data', 'raw_ct_pngs_main')
+    raw_ct_path = os.path.join(BASE_DIR, 'Data', 'dataset_ct_main')
     dataset_path = os.path.join(BASE_DIR, 'Data', 'dataset_efficientnet')
     raw_ft_path = os.path.join(BASE_DIR, 'Data', 'raw_ct_pngs_finetune')
     dataset_ft_path = os.path.join(BASE_DIR, 'Data', 'dataset_efficientnet_finetune')
@@ -1569,6 +1598,49 @@ def train_efficientnet():
 
     if not os.path.exists(path_fine):
         _run_fine_tune_phase(path_main, path_fine, raw_ct_path, raw_ft_path, train_raw_dataset, val_raw_dataset)
+
+    logger.info("Wyliczanie optymalnych progów Youden's J na zbiorze walidacyjnym (RSNA).")
+    
+    val_loader = DataLoader(val_raw_dataset, batch_size=4, shuffle=False, **LOADER_KWARGS)
+    model_main = VolumetricEfficientNet(imaging_config=imaging_config, backbone='efficientnet').to(DEVICE)
+    model_main.load_state_dict(torch.load(path_main, map_location=DEVICE))
+    model_main.eval()
+
+    model_fine = VolumetricEfficientNet(imaging_config=imaging_config, backbone='efficientnet').to(DEVICE)
+    model_fine.load_state_dict(torch.load(path_fine, map_location=DEVICE))
+    model_fine.eval()
+    
+    calib_labels, calib_probs_fine, calib_probs_main = [], [], []
+    with torch.no_grad():
+        for volumes, labels in val_loader:
+            volumes = volumes.to(DEVICE)
+            # Aplikacja ROI jeśli UNet jest dostępny
+            if unet_model is not None:
+                B, S, C, H, W = volumes.shape
+                brain_slices = volumes[:, :, 2:3, :, :].contiguous().view(B * S, 1, H, W)
+                mask_pred = torch.sigmoid(unet_model(brain_slices)).view(B, S, 1, H, W)
+                volumes = volumes * mask_pred
+                
+            with torch.amp.autocast(device_type=DEVICE.type, enabled=(DEVICE.type == 'cuda')):
+                calib_probs_fine.extend(model_fine(volumes)[:, 1].cpu().numpy())
+                calib_probs_main.extend(model_main(volumes)[:, 1].cpu().numpy())
+            calib_labels.extend(labels.numpy())
+
+    calib_labels = np.array(calib_labels)
+    opt_threshold_fine, opt_threshold_main = 0.5, 0.5
+    
+    if len(np.unique(calib_labels)) > 1:
+        fpr_f, tpr_f, thresh_f = roc_curve(calib_labels, calib_probs_fine)
+        if len(thresh_f) > 0: opt_threshold_fine = float(thresh_f[np.argmax(tpr_f - fpr_f)])
+        
+        fpr_m, tpr_m, thresh_m = roc_curve(calib_labels, calib_probs_main)
+        if len(thresh_m) > 0: opt_threshold_main = float(thresh_m[np.argmax(tpr_m - fpr_m)])
+
+    params_path = os.path.join(BASE_DIR, 'output_data', 'Models', 'efficientnet_cascade_params.json')
+    with open(params_path, 'w') as f:
+        json.dump({'THRESH_FINE': opt_threshold_fine, 'THRESH_MAIN': opt_threshold_main}, f)
+        
+    logger.info(f"Zamrożono optymalne progi decyzyjne z RSNA: Fine={opt_threshold_fine:.3f}, Main={opt_threshold_main:.3f}")
 
     logger.info("Trening kaskadowy zakończony pomyślnie!")
 
@@ -1622,8 +1694,8 @@ def uncertainty_aware_soft_voting(unet_model, efficientnet_model, volumes_tensor
     
     with torch.no_grad():
         for s in range(S):
-            slice_rgb = volumes_tensor[:, s, :, :, :]
-            slice_gray = slice_rgb[:, 2:3, :, :].to(DEVICE)
+            slice_bgr = volumes_tensor[:, s, :, :, :]
+            slice_gray = slice_bgr[:, 2:3, :, :].to(DEVICE)
             
             mask_logits = unet_model(slice_gray)
             mask_probs = torch.sigmoid(mask_logits)
@@ -1693,7 +1765,6 @@ def train_routing_agent(model_main: nn.Module, model_fine: nn.Module, val_loader
     model_main.eval()
     model_fine.eval()
     
-    # Zbieramy predykcje modeli, aby szybko trenować agenta w pamięci RAM
     val_data = []
     with torch.no_grad():
         for volumes, labels in val_loader:
@@ -1703,37 +1774,35 @@ def train_routing_agent(model_main: nn.Module, model_fine: nn.Module, val_loader
                 p_main = model_main(volumes)[:, 1].cpu()
             val_data.append((p_fine, p_main, labels))
 
-    for epoch in range(epochs):
-        total_reward = 0.0
-        for p_fine_batch, p_main_batch, labels_batch in val_data:
-            for i in range(len(labels_batch)):
-                pf = p_fine_batch[i].item()
-                pm = p_main_batch[i].item()
-                lbl = labels_batch[i].item()
-                
-                # Stan: [odchylenie od progu Fine, odchylenie od progu Main, niepewność/entropia]
-                p_cls = torch.tensor([1.0 - pf, pf])
-                entropy = -torch.sum(p_cls * torch.log(p_cls + 1e-10)).item()
-                state = torch.tensor([[pf - thresh_fine, pm - thresh_main, entropy]], dtype=torch.float32, device=DEVICE)
-                
-                probs = agent.policy(state)
-                dist = torch.distributions.Categorical(probs)
-                action = dist.sample()
-                log_prob = dist.log_prob(action)
-                
-                # Predykcja na podstawie podjętej akcji i progów Youdena
-                pred = (pf >= thresh_fine) if action.item() == 0 else (pm >= thresh_main)
-                
-                # Funkcja nagrody uwzględniająca karę za False Positive (chroni specyficzność)
-                if pred == lbl:
-                    reward = 1.0
-                else:
-                    reward = -2.0 if pred == 1 and lbl == 0 else -1.5  # Wyższa kara za fałszywy alarm
+    with tqdm(range(epochs), desc="Trening Agenta RL") as agent_pbar:
+        for epoch in agent_pbar:
+            total_reward = 0.0
+            for p_fine_batch, p_main_batch, labels_batch in val_data:
+                for i in range(len(labels_batch)):
+                    pf = p_fine_batch[i].item()
+                    pm = p_main_batch[i].item()
+                    lbl = labels_batch[i].item()
                     
-                agent.update(log_prob, reward)
-                total_reward += reward
-                
-        logger.info(f"RL Agent Trening Epoka [{epoch+1}/{epochs}] | Średnia Nagroda: {total_reward / len(val_loader.dataset):.3f}")
+                    p_cls = torch.tensor([1.0 - pf, pf])
+                    entropy = -torch.sum(p_cls * torch.log(p_cls + 1e-10)).item()
+                    state = torch.tensor([[pf - thresh_fine, pm - thresh_main, entropy]], dtype=torch.float32, device=DEVICE)
+                    
+                    probs = agent.policy(state)
+                    dist = torch.distributions.Categorical(probs)
+                    action = dist.sample()
+                    log_prob = dist.log_prob(action)
+                    
+                    pred = (pf >= thresh_fine) if action.item() == 0 else (pm >= thresh_main)
+                    
+                    if pred == lbl:
+                        reward = 1.0
+                    else:
+                        reward = -2.0 if pred == 1 and lbl == 0 else -1.5 
+                        
+                    agent.update(log_prob, reward)
+                    total_reward += reward
+                    
+            agent_pbar.set_postfix({'Średnia Nagroda': f"{total_reward / len(val_loader.dataset):.3f}"})
 
     agent_path = os.path.join(BASE_DIR, 'output_data', 'Models', 'routing_agent.pth')
     torch.save(agent.state_dict(), agent_path)
@@ -1741,13 +1810,15 @@ def train_routing_agent(model_main: nn.Module, model_fine: nn.Module, val_loader
     return agent
 
 
-def sequential_two_stage_predict(volumes, model_main, model_fine, routing_agent=None, fallback_threshold_main=0.6):
+def sequential_two_stage_predict(volumes, model_main, model_fine, routing_agent=None, safety_threshold_fine=0.5, fallback_threshold_main=0.6):
     """ Kaskada dwustopniowa sterowana przez Agenta RL:
         - Model Fine Tune wstępnie ocenia skan.
         - Agent RL decyduje, czy niepewność wymaga weryfikacji przez model Main, który jest bardziej nagorliwy,
           ale działa z wyższą specyficznością. """
     model_main.eval()
     model_fine.eval()
+    if routing_agent is not None:
+        routing_agent.eval()
     
     with torch.no_grad():
         with torch.amp.autocast(device_type=DEVICE.type, enabled=(DEVICE.type == 'cuda')):
@@ -1770,9 +1841,9 @@ def sequential_two_stage_predict(volumes, model_main, model_fine, routing_agent=
         entropy = -torch.sum(p_cls * torch.log(p_cls + 1e-10)).item()
         
         if routing_agent is not None:
-            state = torch.tensor([[float(p_fine), float(entropy), float(abs(p_fine - 0.5))]], dtype=torch.float32)
+            # Wektor stanu zgodny z reprezentacją używaną podczas treningu agenta
+            state = torch.tensor([[p_fine - safety_threshold_fine, p_main - fallback_threshold_main, entropy]], dtype=torch.float32, device=DEVICE)
             
-            # W trybie ewaluacji/adaptacji włączamy gradienty dla polityki agenta, by móc ją aktualizować
             action_probs = routing_agent.policy(state)
             dist = torch.distributions.Categorical(action_probs)
             action = dist.sample()
@@ -1781,17 +1852,17 @@ def sequential_two_stage_predict(volumes, model_main, model_fine, routing_agent=
             
             action_item = action.item()
             
-            # Akcja 0: Ufamy modelu Fine Tune
+            # Akcja 0: Ufamy modelowi Fine Tune
             if action_item == 0:
-                final_preds[i] = 1 if p_fine >= 0.5 else 0
+                final_preds[i] = 1 if p_fine >= safety_threshold_fine else 0
                 final_probs[i] = p_fine
-            # Akcja 1: Skierowanie do modelu Main (ma większą specyficzność)
+            # Akcja 1: Skierowanie do modelu Main
             else:
                 final_preds[i] = 1 if p_main >= fallback_threshold_main else 0
                 final_probs[i] = p_main
         else:
             log_probs_batch.append(None)
-            if p_fine < 0.3:
+            if p_fine < safety_threshold_fine:
                 final_preds[i] = 0
                 final_probs[i] = p_fine
             else:
@@ -1802,7 +1873,7 @@ def sequential_two_stage_predict(volumes, model_main, model_fine, routing_agent=
 
 
 def evaluate_efficientnet(raw_cq500_path=None, dataset_cq500_path=None):
-    """ Przeprowadzam ewaluację kaskadową z udziałem Agenta RL oraz kalibracją progów (Youden's J) na podzbiorze CQ500. """
+    """ Przeprowadzam ewaluację kaskadową z udziałem Agenta RL na zbiorze CQ500 w trybie ślepego testu. """
     if raw_cq500_path is None:
         raw_cq500_path = os.path.join(BASE_DIR, 'Data', 'dataset_cq500')
     if dataset_cq500_path is None:
@@ -1827,36 +1898,19 @@ def evaluate_efficientnet(raw_cq500_path=None, dataset_cq500_path=None):
         preprocess_raw_ct_to_roi(raw_dir=raw_cq500_path, out_dir=dataset_cq500_path, limit_patients_per_class=None, unet_model=unet_model)
         
     imaging_config = MedicalImagingConfig()
+    
+    # Do ślepego testu wrzucamy cały zbiór testowy, bez odkrawania sztucznego podzbioru do kalibracji w locie
     val_raw_dataset = CTCapsuleDataset(root_dir=dataset_cq500_path, imaging_config=imaging_config, is_train=False)
-    
-    labels_arr = np.array(val_raw_dataset.labels)
-    pos_indices = np.where(labels_arr == 1)[0]
-    neg_indices = np.where(labels_arr == 0)[0]
-    
-    # Podział na zbiór kalibracyjny i zbiór testowy
-    val_loader_calibration = None
-    val_loader_test = None
-    
-    if len(pos_indices) > 5 and len(neg_indices) > 5:
-        rng_sampler = np.random.default_rng(42)
-        pos_calib = rng_sampler.choice(pos_indices, size=int(len(pos_indices)*0.3), replace=False)
-        neg_calib = rng_sampler.choice(neg_indices, size=int(len(neg_indices)*0.3), replace=False)
-        calib_indices = np.concatenate([pos_calib, neg_calib])
-        test_indices = np.setdiff1d(np.arange(len(val_raw_dataset)), calib_indices)
-        
-        calib_dataset = torch.utils.data.Subset(val_raw_dataset, calib_indices)
-        test_dataset = torch.utils.data.Subset(val_raw_dataset, test_indices)
-        
-        val_loader_calibration = DataLoader(calib_dataset, batch_size=4, shuffle=False)
-        val_loader_test = DataLoader(test_dataset, batch_size=4, shuffle=False)
-    else:
-        val_loader_test = DataLoader(val_raw_dataset, batch_size=4, shuffle=False)
+    val_loader_test = DataLoader(val_raw_dataset, batch_size=4, shuffle=False)
         
     path_main = os.path.join(BASE_DIR, 'output_data', 'Models', 'efficientnet_corpus_callosum_main.pth')
     path_fine = os.path.join(BASE_DIR, 'output_data', 'Models', 'efficientnet_corpus_callosum_finetune.pth')
     path_agent = os.path.join(BASE_DIR, 'output_data', 'Models', 'routing_agent.pth')
+    params_path = os.path.join(BASE_DIR, 'output_data', 'Models', 'efficientnet_cascade_params.json')
     
-    if not os.path.exists(path_main) or not os.path.exists(path_fine): return
+    if not os.path.exists(path_main) or not os.path.exists(path_fine): 
+        logger.error("Brak wytrenowanych modeli kaskady w folderze docelowym.")
+        return
 
     model_main = VolumetricEfficientNet(imaging_config=imaging_config, backbone='efficientnet').to(DEVICE)
     model_main.load_state_dict(torch.load(path_main, map_location=DEVICE))
@@ -1873,38 +1927,16 @@ def evaluate_efficientnet(raw_cq500_path=None, dataset_cq500_path=None):
         routing_agent.eval()
         logger.info("Wczytano wytrenowanego Agenta RL do zarządzania kaskadą.")
 
-    # Kalibracja progów decyzyjnych na zbiorze kalibracyjnym (Youden's J)
-    opt_threshold_fine = 0.5
-    opt_threshold_main = 0.5
-    
-    if val_loader_calibration is not None:
-        logger.info("Kalibracja progów decyzyjnych (Statystyka Youdena) na podzbiorze CQ500.")
-        calib_labels, calib_probs_fine, calib_probs_main = [], [], []
-        with torch.no_grad():
-            for volumes, labels in val_loader_calibration:
-                volumes = volumes.to(DEVICE)
-                if unet_model is not None:
-                    B, S, C, H, W = volumes.shape
-                    brain_slices = volumes[:, :, 2:3, :, :].contiguous().view(B * S, 1, H, W)
-                    mask_pred = torch.sigmoid(unet_model(brain_slices)).view(B, S, 1, H, W)
-                    volumes = volumes * mask_pred
-                    
-                calib_probs_fine.extend(model_fine(volumes)[:, 1].cpu().numpy())
-                calib_probs_main.extend(model_main(volumes)[:, 1].cpu().numpy())
-                calib_labels.extend(labels.numpy())
-                
-        calib_labels = np.array(calib_labels)
-        
-        # Wyliczanie progu J-Youdena (max TPR - FPR) za pomocą roc_curve
-        fpr_f, tpr_f, thresh_f = roc_curve(calib_labels, calib_probs_fine)
-        j_scores_f = tpr_f - fpr_f
-        if len(thresh_f) > 0: opt_threshold_fine = float(thresh_f[np.argmax(j_scores_f)])
-        
-        fpr_m, tpr_m, thresh_m = roc_curve(calib_labels, calib_probs_main)
-        j_scores_m = tpr_m - fpr_m
-        if len(thresh_m) > 0: opt_threshold_main = float(thresh_m[np.argmax(j_scores_m)])
-        
-        logger.info(f"Skalibrowane progi J-Youdena -> Fine: {opt_threshold_fine:.3f}, Main: {opt_threshold_main:.3f}")
+    # Wczytywanie wyliczonych na RSNA progów decyzyjnych Youdena dla obu modeli
+    opt_threshold_fine, opt_threshold_main = 0.5, 0.5
+    if os.path.exists(params_path):
+        with open(params_path, 'r') as f:
+            params = json.load(f)
+            opt_threshold_fine = params.get('THRESH_FINE', 0.5)
+            opt_threshold_main = params.get('THRESH_MAIN', 0.5)
+        logger.info(f"Wczytano zamrożone progi decyzyjne z RSNA: Fine={opt_threshold_fine:.3f}, Main={opt_threshold_main:.3f}")
+    else:
+        logger.warning("Brak pliku z progami Youdena. Używam domyślnych (0.50).")
 
     # Faza ewaluacji na zbiorze testowym CQ500
     all_labels, all_probs, all_preds = [], [], [] 
@@ -1923,10 +1955,12 @@ def evaluate_efficientnet(raw_cq500_path=None, dataset_cq500_path=None):
             processed_volumes = volumes
 
         preds_batch, probs_batch, _ = sequential_two_stage_predict(
-            processed_volumes, model_main, model_fine, 
-            thresh_fine=opt_threshold_fine, 
-            thresh_main=opt_threshold_main,
-            routing_agent=routing_agent
+            processed_volumes, 
+            model_main, 
+            model_fine, 
+            routing_agent=routing_agent,
+            safety_threshold_fine=opt_threshold_fine, 
+            fallback_threshold_main=opt_threshold_main
         )
 
         all_probs.extend(probs_batch)
@@ -1948,32 +1982,31 @@ def evaluate_efficientnet(raw_cq500_path=None, dataset_cq500_path=None):
         logger.info(f"Wyniki Ewaluacji Kaskady z Agentem RL - BAcc: {bacc:.1f}% | AUC: {auc:.3f} | Czułość (Sens): {sens:.1f}% | Specyficzność (Spec): {spec:.1f}%")
 
 
-if __name__ == "__main__":
+def run_pipeline():
+    """ Główny orkiestrator kaskady EfficientNet i UNet (Przygotowanie danych -> Trening -> Ewaluacja). """
     raw_ct_path = os.path.join(BASE_DIR, 'Data', 'dataset_ct_main')
     rsna_zip = os.path.join(BASE_DIR, 'Data', 'rsna_dataset.zip')
     rsna_csv = os.path.join(BASE_DIR, 'Data', 'stage_2_train.csv')
 
-    # Warunkowe uruchomienie przygotowania danych tylko wtedy, gdy jeszcze ich nie ma
     if not _has_images(raw_ct_path):
         if os.path.exists(rsna_zip) and os.path.exists(rsna_csv):
             logger.info("Brak surowych danych CT. Uruchamiam automatyczne przygotowanie z RSNA.")
             prepare_rsna_data(rsna_zip, rsna_csv, raw_ct_path, limit_patients=1000)
 
-    # Definicja wszystkich wymaganych plików kaskady
     model_unet = os.path.join(BASE_DIR, 'output_data', 'Models', 'unet_corpus_callosum.pth')
-    model_unet_fine = os.path.join(BASE_DIR, 'output_data', 'Models', 'unet_corpus_callosum_finetune.pth')
     model_efficientnet = os.path.join(BASE_DIR, 'output_data', 'Models', 'efficientnet_corpus_callosum_main.pth')
     model_efficientnet_fine = os.path.join(BASE_DIR, 'output_data', 'Models', 'efficientnet_corpus_callosum_finetune.pth')
 
-    # Sprawdzamy czy wszystkie wytrenowane modele kaskady już istnieją
     if os.path.exists(model_efficientnet) and os.path.exists(model_efficientnet_fine) and os.path.exists(model_unet):
-        logger.info("Znaleziono zapisane wagi modeli EfficientNet oraz UNet. Pomijam trening i przechodzę od razu do ewaluacji.")
+        logger.info("Znaleziono zapisane wagi modeli. Pomijam trening i przechodzę do ewaluacji.")
     else:
-        logger.info("Brakuje plików wag. Uruchamianie treningu głównego EfficientNet wspomaganego przez UNet (z Optuną i K-Fold).")
-        
-        # Upewnienie się, że folder docelowy istnieje przed wielogodzinnym treningiem
+        logger.info("Brakuje plików wag. Uruchamianie głównego treningu kaskady.")
         os.makedirs(os.path.join(BASE_DIR, 'output_data', 'Models'), exist_ok=True)
         train_efficientnet()
         
     logger.info("Ewaluacja modelu na zbiorze testowym CQ500.")
     evaluate_efficientnet()
+
+
+if __name__ == '__main__':
+    run_pipeline()
