@@ -100,7 +100,7 @@ Furthermore, this architecture is built strictly as a decision support tool. It 
 - **Machine Learning:** `Scikit-Learn`, `XGBoost`, `LightGBM`, `CatBoost`, `TabNet`, `InterpretML`, `SkopeRules`
 - **Data Quality & Testing:** Custom Data Quality Assurance Suite (`Great Expectations` inspired)
 - **Optimization & MLOps:** `Optuna`, `SHAP`, `Imbalanced-Learn`
-- **Databases & Cache:** `PostgreSQL`, `MongoDB`, `Redis`
+- **Databases & Cache & Cloud:** `PostgreSQL`, `MongoDB`, `Redis`, `MinIO`
 
 ---
 
