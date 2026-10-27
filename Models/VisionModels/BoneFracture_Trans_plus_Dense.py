@@ -82,7 +82,7 @@ logger = setup_logger()
 
 
 # Dynamiczne wykrywanie ścieżki do głównego katalogu projektu
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # Globalne urządzenie oraz standardowe parametry DataLoaderów
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -457,7 +457,7 @@ def _prepare_oit_cohort(val_loader: DataLoader) -> DataLoader:
     val_dataset_oit = Subset(val_dataset_base, oit_global_indices)
     
     logger.info(f"Kohorta OIT gotowa: {len(val_dataset_oit)} próbek (75% chorych / 25% zdrowych).")
-    return DataLoader(val_dataset_oit, batch_size=val_loader.batch_size, shuffle=False, num_workers=4, pin_memory=(DEVICE.type == 'cuda'))
+    return DataLoader(val_dataset_oit, batch_size=val_loader.batch_size, shuffle=False, num_workers=0, pin_memory=(DEVICE.type == 'cuda'))
 
 
 def _train_epoch(
@@ -724,8 +724,8 @@ def fine_tune_densenet_with_nifti(dataset_dir, epochs=5):
     train_dataset = MonaiDataset(data=train_dicts, transform=train_transforms)
     val_dataset = MonaiDataset(data=val_dicts, transform=val_transforms)
     
-    train_loader = MonaiDataLoader(train_dataset, batch_size=1, shuffle=True, num_workers=4, pin_memory=(DEVICE.type == 'cuda'))
-    val_loader = MonaiDataLoader(val_dataset, batch_size=1, shuffle=False, num_workers=2, pin_memory=(DEVICE.type == 'cuda'))
+    train_loader = MonaiDataLoader(train_dataset, batch_size=1, shuffle=True, num_workers=0, pin_memory=(DEVICE.type == 'cuda'))
+    val_loader = MonaiDataLoader(val_dataset, batch_size=1, shuffle=False, num_workers=0, pin_memory=(DEVICE.type == 'cuda'))
     
     model = DenseNetFractureDetector(pretrained=True, dropout_rate=0.35).to(DEVICE)
     model.load_state_dict(torch.load(model_path, map_location=DEVICE))
@@ -1036,7 +1036,7 @@ if __name__ == "__main__":
         labels_csv = os.path.join(dataset_dir, 'labels.csv')
         
         if os.path.exists(images_dir) and os.path.exists(labels_csv):
-            df_labels = pd.read_csv(labels_csv) if 'pd' in globals() else __import__('pandas').read_csv(labels_csv)
+            df_labels = pd.read_csv(labels_csv)
             
             patient_folders = []
             labels = []
@@ -1065,8 +1065,8 @@ if __name__ == "__main__":
                 train_ds = SkullFractureDataset3D(patient_folders[:train_size], labels[:train_size], is_train=True)
                 val_ds = SkullFractureDataset3D(patient_folders[train_size:], labels[train_size:], is_train=False)
 
-                train_loader = DataLoader(train_ds, batch_size=2, shuffle=True, num_workers=4, pin_memory=True)
-                val_loader = DataLoader(val_ds, batch_size=2, shuffle=False, num_workers=4, pin_memory=True)
+                train_loader = DataLoader(train_ds, batch_size=2, shuffle=True, num_workers=0, pin_memory=True)
+                val_loader = DataLoader(val_ds, batch_size=2, shuffle=False, num_workers=0, pin_memory=True)
                 
                 scaler = get_scaler(DEVICE)
                 train_all_fracture_models(train_loader, val_loader, main_epochs=12, fine_epochs=6)

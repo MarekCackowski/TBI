@@ -98,7 +98,7 @@ logger = setup_logger()
 NUM_WORKERS = 4
 
 # Dynamiczne wykrywanie ścieżki do głównego katalogu projektu
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # Globalne urządzenie dla całego skryptu
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -179,18 +179,15 @@ def objective(trial: optuna.Trial) -> float:
         train_loader = DataLoader(train_sub, batch_size=config.batch_size, sampler=sampler, **LOADER_KWARGS)
         val_loader_eval = DataLoader(val_sub, batch_size=config.batch_size, shuffle=False, **LOADER_KWARGS)
 
-
+        # Inicjalizacja modelu CRNN z pretrenowanym ResNet50 i dynamicznym ustawieniem biasów w głowicy klasyfikacyjnej
         model = VolumetricMedicalResNetCRNN(task='multilabel', num_classes=config.num_classes).to(DEVICE)
         _initialize_head_biases(model, train_labels_array, DEVICE)
 
+        # Stosujemy optymalizator AdamW z dynamicznym harmonogramem LR i wagą regularizacji nastawioną na wczesne odrzucanie nadmiernie dopasowanych wag
         optimizer = optim.AdamW(model.parameters(), lr=config.lr_main, weight_decay=config.weight_decay)
         criterion = MultiLabelFocalLoss(gamma_pos=2.0, gamma_neg=2.0)
 
-        # To, gdzie jest GradScaler, zależy od wersji PyTorch. W nowszych wersjach jest w torch.amp, w starszych w torch.cuda.amp
-        try:
-            scaler = torch.amp.GradScaler(DEVICE.type, enabled=(DEVICE.type == 'cuda'))
-        except AttributeError:
-            scaler = torch.cuda.amp.GradScaler(enabled=(DEVICE.type == 'cuda'))
+        scaler = get_scaler()
         
         best_bacc = 0.0
         for epoch in range(config.epochs_main):
@@ -201,10 +198,8 @@ def objective(trial: optuna.Trial) -> float:
             if bacc > best_bacc:
                 best_bacc = bacc
                 
-            # Raportujemy wynik do Optuny po każdej epoce
             trial.report(bacc, epoch)
             
-            # Jeśli próba radzi sobie gorzej niż mediana poprzednich, Optuna ją natychmiast przerywa
             if trial.should_prune():
                 raise optuna.exceptions.TrialPruned()
         
@@ -216,6 +211,7 @@ def objective(trial: optuna.Trial) -> float:
     except Exception as e:
         logger.error(f"Błąd w próbie Optuny: {e}")
         return 0.0
+
 
 def run_hyperparameter_optimization():
     """ Uruchamia optymalizację z aktywnym MedianPruner. """
@@ -1369,8 +1365,8 @@ class CQ500Evaluator:
         self.device = device
         self.batch_size = batch_size
         
-        self.base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        self.dataset_path = os.path.join(self.base_dir, 'Data', 'dataset_cq500')
+        # Zastosowanie globalnego BASE_DIR (wchodzenie o 3 poziomy wyżej)
+        self.dataset_path = os.path.join(BASE_DIR, 'Data', 'dataset_cq500')
 
     def _extract_probs(self, out_tensor, model):
         """ Bezpieczna ekstrakcja prawdopodobieństw niezależna od kształtu Ground Truth. """
@@ -1384,8 +1380,10 @@ class CQ500Evaluator:
             return torch.sigmoid(out_tensor).cpu().numpy()
 
     def evaluate(self):
-        if not os.path.exists(self.dataset_path) or not any(os.scandir(self.dataset_path)):
-            logger.error(f"Brak folderu {self.dataset_path} lub jest on pusty.")
+        # Dodana bezpośrednia weryfikacja obecności poprawnego pliku labels.csv
+        labels_path = os.path.join(self.dataset_path, 'labels.csv')
+        if not os.path.exists(self.dataset_path) or not os.path.exists(labels_path):
+            logger.error(f"Brak folderu {self.dataset_path} lub wymaganego pliku etykiet {labels_path}.")
             return
 
         logger.info("Rozpoczynam walidację kaskadową na zbiorze CQ500.")
@@ -1396,10 +1394,8 @@ class CQ500Evaluator:
             return
 
         cq500_loader = DataLoader(cq500_dataset, batch_size=self.batch_size, shuffle=False, **LOADER_KWARGS)
-
-        fine_model_path = os.path.join(self.base_dir, 'output_data', 'Models', 'crnn_fine_uncertainty.pth')
-        main_model_path = os.path.join(self.base_dir, 'output_data', 'Models', 'crnn_main_diagnosis.pth')
-        thresholds_path = os.path.join(self.base_dir, 'output_data', 'Models', 'crnn_optimal_thresholds.npy')
+        fine_model_path = os.path.join(BASE_DIR, 'output_data', 'Models', 'crnn_fine_uncertainty.pth')
+        main_model_path = os.path.join(BASE_DIR, 'output_data', 'Models', 'crnn_main_diagnosis.pth')
 
         self.model_fine.load_state_dict(torch.load(fine_model_path, weights_only=True, map_location=self.device))
         self.model_main.load_state_dict(torch.load(main_model_path, weights_only=True, map_location=self.device))
@@ -1416,7 +1412,7 @@ class CQ500Evaluator:
                     out_fine = self.model_fine(volumes)
                     out_main = self.model_main(volumes)
                     
-                    # Użycie nowej, bezpiecznej metody ekstrakcji
+                    # Ekstrakcja prawdopodobieństw w zależności od architektury modelu (sigmoid, softmax, etc.)
                     probs_fine = self._extract_probs(out_fine, self.model_fine)
                     probs_main = self._extract_probs(out_main, self.model_main)
 
@@ -1427,10 +1423,6 @@ class CQ500Evaluator:
         y_true = np.vstack(all_targets).astype(int)
         y_prob_fine = np.vstack(all_probs_fine).astype(np.float32)
         y_prob_main = np.vstack(all_probs_main).astype(np.float32)
-
-        # Bezpieczne dopasowanie progów z odwróceniem etykiet
-        logger.info("Odwracam etykiety dla zbioru CQ500 (y_true = 1 - y_true) w celu ujednolicenia z modelem.")
-        y_true = 1 - y_true
 
         # Ponieważ CQ500 ma inny rozkład, wyznaczamy progi maksymalizujące (Czułość + Specyficzność - 1)
         thresholds_main = np.zeros(y_true.shape[1])
@@ -1448,15 +1440,16 @@ class CQ500Evaluator:
 
         logger.info(f"Wyznaczono optymalne progi Youdena dla CQ500 (średni próg: {np.mean(thresholds_main):.3f})")
 
-        """ Dedykowana złagodzona logika kaskady. """
-        # Złagodzenie warunku fine (np. obniżenie wymogu ekstremalnej pewności)
+        """ Dedykowana złagodzona logika kaskady, w celu zwiększenia czułości przy minimalnym spadku AUC. """
         is_patient_positive_fine = np.any(y_prob_fine >= (thresholds_fine * 0.8), axis=1)
 
-        params_path = os.path.join(self.base_dir, 'output_data', 'Models', 'crnn_cascade_params.json')
+        # Wyliczamy parametry kaskady z pliku, jeśli istnieje, aby uniknąć nadmiernej penalizacji w przypadku CQ500
+        params_path = os.path.join(BASE_DIR, 'output_data', 'Models', 'crnn_cascade_params.json')
         if os.path.exists(params_path):
             with open(params_path, 'r') as f:
                 cascade_params = json.load(f)
             best_penalty = cascade_params.get('TRUST_PENALTY', 0.10)
+
             # Obniżamy próg ekstremalnej pewności, żeby model częściej przepuszczał podejrzenia
             best_extreme_th = min(cascade_params.get('EXTREME_CONFIDENCE', 0.90), 0.75)
             logger.info(f"Wczytano i dostosowano parametry kaskady: TRUST_PENALTY = {best_penalty:.2f}, EXTREME_CONFIDENCE = {best_extreme_th:.2f}")
@@ -1493,7 +1486,8 @@ class CQ500Evaluator:
         macro_bacc = (macro_sens + macro_spec) / 2.0
         auc = np.mean(class_aucs) if class_aucs else 0.5
         
-        ebm_export_path = os.path.join(self.base_dir, 'output_data', 'Models', 'ebm_cascade_features.npz')
+        # Eksportujemy surowe cechy prawdopodobieństw do pliku .npz, aby umożliwić dalszą analizę lub wizualizację
+        ebm_export_path = os.path.join(BASE_DIR, 'output_data', 'Models', 'ebm_cascade_features.npz')
         np.savez_compressed(
             ebm_export_path,
             y_prob_fine=y_prob_fine,           

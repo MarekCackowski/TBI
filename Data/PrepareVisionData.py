@@ -5,7 +5,7 @@ import os
 import shutil
 from typing import Optional
 import zipfile
-from Models.ModzelBody_UNet_to_EfficientNet import MedicalImagingConfig
+from Models.VisionModels.ModzelBody_UNet_to_EfficientNet import MedicalImagingConfig
 import boto3
 from botocore.exceptions import ClientError
 import pandas as pd

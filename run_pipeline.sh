@@ -25,6 +25,6 @@ else
 fi
 
 DOCKER_BUILDKIT=0 docker-compose build --no-cache tbi_app && \
-docker-compose up -d tbi_postgres tbi_mongo tbi_redis tbi-minio && \
+docker-compose up -d tbi_postgres tbi_mongo tbi_redis tbi_minio && \
 sleep 5 && \
 docker-compose run --rm tbi_app python -u App/RunAll.py

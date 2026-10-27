@@ -18,7 +18,7 @@ from sklearn.exceptions import NotFittedError
 from sklearn.decomposition import PCA
 
 # Import Modulów Projektu TBI
-from Models.IntracranialHemorrhage_CRNN import VolumetricMedicalResNetCRNN
+from Models.VisionModels.IntracranialHemorrhage_CRNN import VolumetricMedicalResNetCRNN
 from Models.ModzelBodyExtractorCaps import UNet, VolumetricCapsNet
 from Models.BoneFractureTR_Dense import DenseNetFractureDetector, BoneWindowTransform
 from TBI import generate_icu_clinical_scenario, BayesianTrajectoryMonitor

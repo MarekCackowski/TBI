@@ -7,7 +7,7 @@ from pydicom import config
 config.settings.reading_validation_mode = config.IGNORE
 import logging
 
-logging.basicConfig(level=logging.INFO)
+# Poprawiona konfiguracja logowania (usunięto błędy składniowe z diffa)
 logging.basicConfig(
     stream=sys.stdout,
     level=logging.INFO,
@@ -31,8 +31,8 @@ def verify_database_schema():
         "patients": ["patient_id", "age", "diabetes_mellitus"],
         "visits": ["hadm_id", "patient_id", "hospital_outcome_death"],
         "clinical_measurements_temporal": ["gcs_eyes", "gcs_motor", "gcs_verbal", "sysbp_min", "is_intubated"],
-        "extracted_radiology_features": ["vision_midline_shift_mm", "nlp_brain_aneurysm"],
-        "mimic_icu_features": ["icp_max", "rsbi", "mannitol_administered"]
+        "extracted_radiology_features": ["vision_midline_shift_mm", "vision_basal_cisterns"],
+        "mimic_icu_features": ["icp_max", "mannitol_administered"]
     }
 
     try:
@@ -63,7 +63,6 @@ def verify_database_schema():
         conn.close()
         return True
     except (psycopg2.OperationalError, psycopg2.DatabaseError) as e:
-        # Jeśli baza jeszcze wstaje lub wystąpił błąd połączenia/zapytania, uznajemy schemat za niegotowy
         logger.error(f"Błąd podczas weryfikacji bazy (serwer niedostępny lub błąd zapytania): {e}")
         return False
 
@@ -138,7 +137,6 @@ def run_step(script_path, expected_output=None, optional=False, expected_file=No
 
 
 if __name__ == "__main__":
-    """ docker-compose up -d mongo && docker-compose run --rm tbi_app python run_pipeline.py """
     logger.info("Start orkiestratora projektu TBI.")
 
     # Weryfikacja schematu kolumn w PostgreSQL 
@@ -159,21 +157,37 @@ if __name__ == "__main__":
     else:
         run_step(os.path.join("Data", "PrepareVisionData.py"), expected_output=os.path.join("Data", "dataset_ct_main"), expected_file="labels.csv")
 
-    # Trening CRNN (teraz wymusza ewaluację, jeśli wagi istnieją)
+    # Trening CRNN dla krwawień wewnątrzczaszkowych (uwzględniamy podfolder VisionModels)
     run_step(
-        os.path.join("Models", "IntracranialHemorrhage_CRNN.py"), 
+        os.path.join("Models", "VisionModels", "IntracranialHemorrhage_CRNN.py"), 
         expected_output=os.path.join("output_data", "Models", "crnn_fine_uncertainty.pth"),
         eval_if_exists=True
     )
 
-    # Trening UNet i EfficientNet
-    run_step(os.path.join("Models", "ModzelBody_UNet_to_EfficientNet.py"), expected_output=os.path.join("output_data", "Models", "efficientnet_corpus_callosum_finetune.pth"))
+    # Trening EfficientNet dla ciała modzelowatego
+    run_step(
+        os.path.join("Models", "VisionModels", "ModzelBody_UNet_to_EfficientNet.py"), 
+        expected_output=os.path.join("output_data", "Models", "efficientnet_best.pth"),
+        optional=True
+    )
 
-    # Trening DenseNet+Transformer 3D
-    run_step(os.path.join("Models", "BoneFracture_DenseNet_ViT.py"), expected_output=os.path.join("output_data", "Models", "fracture_best.pth"))
+    # Trening UNet i EfficientNet (Ciało Modzelowate)
+    run_step(
+        os.path.join("Models", "VisionModels", "ModzelBody_UNet_to_EfficientNet.py"), 
+        expected_output=os.path.join("output_data", "Models", "efficientnet_corpus_callosum_finetune.pth")
+    )
 
-    # Główny skrypt analityczny i złączenie
-    run_step(os.path.join("Models", "TBI.py"), expected_output=os.path.join("output_data", "Models", "holistic_cascade_e2e.pth"))
+    # Trening DenseNet+ViT / Trans (Złamania kości) - dopasowano do nazwy pliku z TBI_3.py
+    run_step(
+        os.path.join("Models", "VisionModels", "BoneFracture_Trans_plus_Dense.py"), 
+        expected_output=os.path.join("output_data", "Models", "fracture_best.pth")
+    )
+
+    # Główny skrypt analityczny i integracja kaskadowa (TBI.py załóżmy że leży w Models/ lub w głównym katalogu)
+    run_step(
+        os.path.join("Models", "TBI.py"), 
+        expected_output=os.path.join("output_data", "Models", "holistic_cascade_e2e.pth")
+    )
 
     logger.info("Cały proces orkiestracji zakończony pomyślnie! Wszystkie moduły wizyjne, językowe i tabelaryczne zostały zintegrowane.")
     logger.info("Ostateczny zintegrowany model kaskady oraz wagi modeli znajdują się w folderze 'output_data/Models'")

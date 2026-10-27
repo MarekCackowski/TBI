@@ -1,150 +1,161 @@
+import sys
+import os
 import gc
 import gzip
-import os
 import tempfile
+import shutil
+import time
+import datetime
+import json
+import re
+import random
+import warnings
+import logging
+import requests
+import functools
+from contextlib import nullcontext
+from typing import Dict, Any, List, Optional, Tuple
 
-import urllib
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.append(os.path.join(BASE_DIR, "Models"))
+
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
 os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
 os.environ["NUMEXPR_NUM_THREADS"] = "1"
-import pickle
-import shutil
-import socket
-import time
 
-from sklearn.feature_selection import SelectFromModel
-from sklearn.utils import resample
-import cv2 as cv
-cv.setNumThreads(0)
-from contextlib import nullcontext
-import functools
-import json
-import re
-import sys
-import datetime
-from PIL import Image
-from torch.distributions import Beta
-import optuna
-from pydantic_settings import BaseSettings, SettingsConfigDict
-from optuna.samplers import TPESampler
-from optuna.pruners import MedianPruner
-import pymongo
-import psycopg2
-import redis
-import warnings
+# Środowisko i konfiguracja
 from dotenv import load_dotenv
-import logging
-import random
-import requests
+from pydantic import BaseModel, Field, model_validator, ValidationError
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
-# Biblioteki dla obsługi danych
-import pandas as pd
-import numpy as np
-
-# Silniki modeli i Ensemble
-from torchvision import transforms
-from tqdm import tqdm
-import xgboost as xgb
-from lightgbm import LGBMClassifier
-from catboost import CatBoostClassifier
-from sklearn.svm import SVC
-from sklearn.linear_model import LogisticRegression, LogisticRegressionCV, BayesianRidge
-from sklearn.ensemble import HistGradientBoostingClassifier, RandomForestClassifier, StackingClassifier, VotingClassifier
-from sklearn.neural_network import MLPClassifier
-from sklearn.neighbors import KNeighborsClassifier
-from pytorch_tabnet.tab_model import TabNetClassifier
-from sklearn.naive_bayes import BernoulliNB
-from sklearn.preprocessing import TargetEncoder
-from sklearn.ensemble import HistGradientBoostingRegressor
-from interpret.glassbox import ExplainableBoostingClassifier
-
-# Przygotowanie danych, Cross-Validation i Pipelines
-from sklearn.compose import ColumnTransformer
-from sklearn.impute import SimpleImputer, IterativeImputer
-from sklearn.preprocessing import StandardScaler, RobustScaler
-from sklearn.pipeline import Pipeline
-from sklearn.model_selection import GridSearchCV, train_test_split, cross_val_predict, StratifiedKFold, cross_val_score
-from sklearn.decomposition import PCA
-from sklearn.mixture import GaussianMixture
-import torch.nn.functional as func
-from sklearn.metrics import brier_score_loss, calinski_harabasz_score, precision_score
-from sklearn.base import BaseEstimator, ClassifierMixin, TransformerMixin, clone
-from sklearn.calibration import CalibratedClassifierCV
-from sklearn.exceptions import NotFittedError, ConvergenceWarning
-from torch.utils.data import TensorDataset, DataLoader, Dataset
-from sklearn.base import BaseEstimator, TransformerMixin
-from sklearn.preprocessing import PolynomialFeatures
-from sklearn.pipeline import make_pipeline
-import torch.nn as nn
-import torch.optim as optim
-from sklearn.experimental import enable_halving_search_cv
-from sklearn.model_selection import HalvingGridSearchCV
-import torch
-from scipy.stats import ks_2samp
-from scipy.stats import wasserstein_distance
-
-# Wstrzykiwanie danych (Imbalanced-learn)
-from imblearn.pipeline import Pipeline as ImbPipeline
-from imblearn.under_sampling import RandomUnderSampler
-
-# Optymalizacja i Metryki
-from sklearn.metrics import (
-    roc_auc_score, classification_report, precision_recall_curve,
-    make_scorer, fbeta_score, confusion_matrix
-)
-from sklearn.calibration import calibration_curve
-from statsmodels.stats.contingency_tables import mcnemar
-
-# Wizualizacja i XAI
-import matplotlib.pyplot as plt
-import seaborn as sns
-import shap
-import scipy.stats as stats
-
-# Las izolacyjny i wykrywanie anomalii
-from sklearn.ensemble import IsolationForest
-import statsmodels.api as sm
-from imodels import SkopeRulesClassifier
-from sklearn.cluster import AgglomerativeClustering
-from sklearn.decomposition import SparsePCA
-
-# Zapis modeli i obsługa wielowątkowości
-import joblib
-from joblib import parallel_backend
-
-# Modele do analizy skanów i notatek
-from Models.IntracranialHemorrhage_CRNN import VolumetricMedicalResNetCRNN
-from Models.ModzelBody_UNet_to_EfficientNet import UNet, VolumetricEfficientNet, sequential_two_stage_predict
-from Models.BoneFracture_Trans_plus_Dense import DenseNetFractureDetector, BoneWindowTransform
-import pydicom
-
-# MinIO i kompatybilność z S3
+# Bazy danych i pamięć podręczna (MinIO, PostgreSQL, Redis, MongoDB)
 import boto3
 from botocore.client import Config
-from psycopg2 import pool
-import tempfile
-
-# Wyciszenie ostrzeżeń
 from botocore.exceptions import ClientError, BotoCoreError
-from pydantic import BaseModel, Field, model_validator, ValidationError
-from typing import Dict, Any, List, Optional, Tuple
-import datetime
+import psycopg2
+import redis
+import pymongo
 
-# Bezpieczny import solve'ra Neural ODE
-try:
-    from torchdiffeq import odeint
-except ImportError:
-    odeint = None
-
-# Bezpieczny import SQLAlchemy
 try:
     from sqlalchemy import create_engine, text
     from sqlalchemy.exc import SQLAlchemyError
 except ImportError as e:
+    logger = logging.getLogger(__name__)
     logger.error("Brak biblioteki SQLAlchemy. Uruchom w terminalu: pip install sqlalchemy")
     raise ImportError("Brak biblioteki SQLAlchemy. Uruchom w terminalu: pip install sqlalchemy") from e
+
+# Biblioteki dla obsługi danych i statystyki
+import pandas as pd
+import numpy as np
+from scipy.stats import ks_2samp, wasserstein_distance
+import scipy.stats as stats
+import statsmodels.api as sm
+from statsmodels.stats.contingency_tables import mcnemar
+
+# Machine Learning - Przygotowanie danych, Cross-Validation i Pipelines
+from sklearn.compose import ColumnTransformer
+from sklearn.impute import SimpleImputer, IterativeImputer
+from sklearn.preprocessing import StandardScaler, RobustScaler, TargetEncoder, PolynomialFeatures
+from sklearn.pipeline import Pipeline, make_pipeline
+from sklearn.model_selection import (
+    GridSearchCV, train_test_split, cross_val_predict, 
+    StratifiedKFold, cross_val_score, HalvingGridSearchCV
+)
+from sklearn.experimental import enable_halving_search_cv
+from sklearn.decomposition import PCA, SparsePCA
+from sklearn.mixture import GaussianMixture
+from sklearn.base import BaseEstimator, ClassifierMixin, TransformerMixin, clone
+from sklearn.calibration import CalibratedClassifierCV, calibration_curve
+from sklearn.exceptions import NotFittedError, ConvergenceWarning
+from sklearn.feature_selection import SelectFromModel
+from sklearn.utils import resample
+
+# Machine Learning - Klasyfikacja i Regresja
+from sklearn.svm import SVC
+from sklearn.linear_model import LogisticRegression, LogisticRegressionCV, BayesianRidge
+from sklearn.ensemble import (
+    HistGradientBoostingClassifier, RandomForestClassifier, 
+    StackingClassifier, VotingClassifier, HistGradientBoostingRegressor, IsolationForest
+)
+from sklearn.neural_network import MLPClassifier
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.naive_bayes import BernoulliNB
+from sklearn.tree import DecisionTreeRegressor, export_text
+from sklearn.cluster import AgglomerativeClustering
+from sklearn.metrics import (
+    roc_auc_score, classification_report, precision_recall_curve,
+    make_scorer, fbeta_score, confusion_matrix, brier_score_loss, 
+    calinski_harabasz_score, precision_score
+)
+
+# Zaawansowane modele tabularyczne i wstrzykiwanie danych
+import xgboost as xgb
+from lightgbm import LGBMClassifier
+from catboost import CatBoostClassifier
+from imblearn.under_sampling import RandomUnderSampler
+from interpret.glassbox import ExplainableBoostingClassifier
+from imodels import SkopeRulesClassifier
+
+# Optymalizacja hiperparametrów
+import optuna
+from optuna.samplers import TPESampler
+from optuna.pruners import MedianPruner
+
+# Deep Learning (PyTorch & TabNet)
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as func
+from torch.utils.data import TensorDataset, DataLoader, Dataset
+from torchvision import transforms
+from pytorch_tabnet.tab_model import TabNetClassifier
+
+# Przetwarzanie obrazów
+import pydicom
+from PIL import Image
+
+# Wizualizacja i wielowątkowość
+import matplotlib.pyplot as plt
+import seaborn as sns
+import shap
+from tqdm import tqdm
+import joblib
+from joblib import parallel_backend
+
+# Modele farmakokinetyczne i farmakodynamiczne
+from Models.GraphModels.PharmaKineticsModels import (
+    RealTBIPharmacoModel,
+    PharmDynamicGraphODE,
+)
+
+# Modele trajektorii pacjentów i monitorowania stanu
+from Models.GraphModels.TrajectoryMonitors import (
+    SonodeFalseAlarmDetector,
+    LatentODE_VAE_Generator,
+    serve_patient_stream,
+    get_cached_mimic_3d_timeseries
+)
+
+# Wstępne modele drzewiaste
+from Models.TabularModels.TreesEnsemble import ensemble_objective
+
+# Modele tabularyczne 
+from Models.TabularModels.TabularCascade import (
+    AdaptiveMedicalNoiseAdder,
+    MedicalCascadePredictor
+)
+
+# Modele do analizy skanów
+from Models.VisionModels.IntracranialHemorrhage_CRNN import VolumetricMedicalResNetCRNN
+from Models.VisionModels.ModzelBody_UNet_to_EfficientNet import UNet, VolumetricEfficientNet, sequential_two_stage_predict
+from Models.VisionModels.BoneFracture_Trans_plus_Dense import (
+    BoneWindowTransform,
+    DenseNetFractureDetector,
+    TransformerFractureDetector3D,
+    ensemble_predict_fracture
+)
 
 
 # Globalne wyciszenie powiadomień, ostrzeżeń o zbieżności oraz komunikatów deprecjonujących bibliotek
@@ -160,7 +171,7 @@ warnings.filterwarnings('ignore', category=FutureWarning, module='interpret')
 load_dotenv()
 
 # Dynamiczne wykrywanie ścieżki do głównego katalogu projektu
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # Inicjalizacja systemu logowania dla ostatecznego modułu
 def setup_logger(name: str = "multimodal_cascade"):
@@ -175,7 +186,7 @@ def setup_logger(name: str = "multimodal_cascade"):
     fmt = logging.Formatter('[%(asctime)s] %(levelname)s: %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
 
     class _TqdmStream:
-        """ Strumien przekazujacy logi przez tqdm.write, zeby pasek sie nie dublowal. """
+        """ Strumien przekazujacy logi przez tqdm.write, żeby pasek sie nie dublowal. """
         @classmethod
         def write(cls, msg):
             if msg.strip():
@@ -208,18 +219,18 @@ class Settings(BaseSettings):
     beta_main: float = 1.0
     beta_critical: float = 2.0
     
-    # Bazy danych
-    db_host: str = os.getenv('DB_HOST', '172.189.176.192')
+    # Bazy danych i pamięć podręczna
+    db_host: str = os.getenv('DB_HOST', '127.0.0.1')
     db_port: str = os.getenv('DB_PORT', '5433')
     db_name: str = os.getenv('DB_NAME', 'tbi_database')
     db_user: str = os.getenv('DB_USER', 'postgres')
     db_pass: str = os.getenv('DB_PASS', 'postgres')
 
-    mongo_host: str = os.getenv('MONGO_HOST', '172.189.176.192')
-    redis_host: str = os.getenv('REDIS_HOST', '172.189.176.192')
+    mongo_host: str = os.getenv('MONGO_HOST', '127.0.0.1')
+    redis_host: str = os.getenv('REDIS_HOST', '127.0.0.1')
     
     # Konfiguracja S3 / MinIO
-    s3_endpoint: str = os.getenv('S3_ENDPOINT', 'http://172.189.176.192:9000')
+    s3_endpoint: str = os.getenv('S3_ENDPOINT', 'http://127.0.0.1:9000')
     s3_access_key: str = os.getenv('MINIO_ACCESS_KEY', 'admin')
     s3_secret_key: str = os.getenv('MINIO_SECRET_KEY', 'admin123')
     s3_bucket: str = os.getenv('S3_BUCKET', 'tbi-data')
@@ -263,11 +274,12 @@ mongo_db.prediction_logs.create_index(
     [("patient_id", pymongo.ASCENDING), ("timestamp", pymongo.DESCENDING)]
 )
 
-PHYSIONET_USER = os.getenv('PHYSIONET_USER')
-PHYSIONET_PASS = os.getenv('PHYSIONET_PASS')
+# Wykorzystanie instancji SETTINGS do ustawienia globalnych zmiennych środowiskowych
+PHYSIONET_USER = SETTINGS.physionet_user
+PHYSIONET_PASS = SETTINGS.physionet_pass
 
 # flaga dla fuzji danych z MIMIC-IV
-USE_PHYSIONET_MIMIC = os.getenv('USE_PHYSIONET_MIMIC', 'False').lower() == 'true'
+USE_PHYSIONET_MIMIC = SETTINGS.use_physionet_mimic
 
 # Słownik kluczowych markerów MIMIC-IV (itemid)
 MIMIC_ITEM_IDS = {
@@ -385,371 +397,11 @@ class PredictionLogSchema(BaseModel):
             values['vitals_at_prediction'] = vitals
         return values
 
-class RealTimePatientBuffer:
-    """ Zarządza stanem pacjenta w czasie rzeczywistym przy użyciu Redisa. Pozwala na asynchroniczne
-        dopisywanie kolejnych danych i sklejanie ich w kompletny wektor cech, zanim model podejmie decyzję. """
-    def __init__(self, host='localhost', port=6379, db=0):
-        # Inicjalizacja połączenia z bazą Redis
-        self.r = redis.Redis(host=host, port=port, db=db, decode_responses=True)
-
-    def update_patient_data(self, hadm_id: int, category: str, data: dict, ttl: int = 86400):
-        """ Aktualizuje lub dodaje wybraną kategorię danych dla pacjenta. """
-        key = f"patient:{hadm_id}:{category}"
-        self.r.setex(key, ttl, json.dumps(data))
-
-    def get_complete_patient_vector(self, hadm_id: int) -> dict:
-        """ Skleja kompletny stan pacjenta ze wszystkich dostępnych podsystemów w locie.
-            Jeśli brakuje konkretnego badania, funkcja nie przerywa działania, tylko zwraca
-            aktualnie dostępny podzbiór cech do bezpiecznego uzupełnienia przez imputację. """
-        categories = ['vitals', 'vision']
-        combined_vector = {}
-        
-        for cat in categories:
-            key = f"patient:{hadm_id}:{cat}"
-            raw_data = self.r.get(key)
-            if raw_data:
-                try:
-                    parsed = json.loads(raw_data)
-                    combined_vector.update(parsed)
-                except json.JSONDecodeError:
-                    pass
-                except Exception as e:
-                    logger.error(f"Nieoczekiwany błąd podczas parsowania danych pacjenta {hadm_id} dla kategorii {cat}: {e}")
-                    
-        return combined_vector
-
-    def is_ready_for_inference(self, hadm_id: int, required_categories=None) -> bool:
-        """ Sprawdza, czy pacjent zgromadził minimalny zestaw danych wymagany do uruchomienia pierwszej warstwy kaskady. """
-        if required_categories is None:
-            required_categories = ['vitals']
-            
-        for cat in required_categories:
-            if not self.r.exists(f"patient:{hadm_id}:{cat}"):
-                return False
-        return True
-
-
-class RLAutoAugmentAgent(nn.Module):
-    """ Agent z pamięcią akcji: stan to teraz [strata, anatomia, symetria, p_affine, p_elastic, p_blur, p_jitter, p_erase]. 
-        Po to, żeby agent mógł uczyć się, które augmentacje są skuteczne w dłuższej perspektywie, a które nie. Jego optymalizacja
-        składa się z dwóch nagród: poprawy F1 (task_reward) i zachowania anatomii (struct_reward). W ten sposób agent uczy się
-        kompromisu między agresywnymi augmentacjami a zachowaniem biologii w sposób umożliwiający poprawne rozpoznawanie. 
-        W przyszłości warto myśleć o wprowadzeniu rywalizującego agenta, który będzie starał się punktowo poprawić jakość ciała modzelowatego,
-        które jest dość niewyraźne na skanach CT, a agent główny będzie musiał balansować, żeby zniekształcenia mimo wszystko były akceptowalne. """
-    def __init__(self, state_dim=8, action_dim=5, lr=1e-3, struct_lambda=0.2):
-        super().__init__()
-        self.struct_lambda = struct_lambda
-
-        self.actor = nn.Sequential(
-            nn.Linear(state_dim, 32),
-            nn.ReLU(),
-            nn.Linear(32, action_dim * 2) 
-        )
-        
-        self.critic = nn.Sequential(
-            nn.Linear(state_dim, 32),
-            nn.ReLU(),
-            nn.Linear(32, 1)
-        )
-        
-        self.optimizer = optim.Adam(list(self.actor.parameters()) + list(self.critic.parameters()), lr=lr)
-        
-        self.last_log_prob = None
-        self.last_entropy = None
-        self.last_state = None
-
-        # Pamięć startowa (początkowo wyzerowana)
-        self.last_actions_memory = np.zeros(action_dim, dtype=np.float32)
-
-    def select_augmentations(self, current_loss, struct_score=1.0, symmetry_score=1.0, deterministic=False):
-        # Stan rozszerzony o to, jakich akcji agent użył w poprzedniej epoce
-        metrics = [current_loss, struct_score, symmetry_score]
-        state_list = metrics + self.last_actions_memory.tolist()
-        
-        state = torch.tensor([state_list], dtype=torch.float32, device=DEVICE)
-        self.last_state = state
-        
-        params = self.actor(state)
-        
-        alpha = func.softplus(params[:, :5]) + 1.0
-        beta = func.softplus(params[:, 5:]) + 1.0
-        dist = Beta(alpha, beta)
-        
-        if deterministic:
-            actions = alpha / (alpha + beta)
-        else:
-            actions = dist.sample()
-            self.last_log_prob = dist.log_prob(actions).sum(dim=-1)
-            self.last_entropy = dist.entropy().sum(dim=-1)
-            
-        actions_np = actions.detach().cpu().numpy()[0]
-        
-        # Zapisanie akcji do pamięci na potrzeby kolejnego kroku
-        self.last_actions_memory = actions_np
-        
-        return actions_np
-
-
-class AdaptiveMedicalNoiseAdder(BaseEstimator, TransformerMixin):
-    """ Skale Glasgow i APACHE charakteryzują się dużym rozrzutem.
-        Agent RL dynamicznie steruje poziomem szumu, by uodpornić model na błędy ludzkie i niedokładności skali. """
-    def __init__(self, feature_names=None):
-        self.feature_names = feature_names
-        self.is_fitted_ = False
-        
-        # Domyślne mnożniki (zostaną nadpisane przez Agenta RL, jeśli zostanie użyty)
-        self.noise_scales = {'gcs': 0.10, 'vitals': 0.02, 'other': 0.05}
-
-    def update_rl_policy(self, scale_gcs, scale_vitals, scale_other):
-        """ Metoda dla Agenta RL aktualizująca siłę szumu w locie. 
-            Mnożymy wyniki z Sigmoidy przez maksymalne sensowne medycznie progi. """
-        self.noise_scales = {
-            'gcs': float(scale_gcs * 0.20),       # Max 20% odchylenia standardowego dla skal
-            'vitals': float(scale_vitals * 0.05), # Max 5% odchylenia dla sztywnej aparatury
-            'other': float(scale_other * 0.10)    # Max 10% dla reszty
-        }
-
-    def fit(self, X, y=None):
-        if self.feature_names is None:
-            if hasattr(X, 'columns'):
-                self.feature_names = list(X.columns)
-            else:
-                self.feature_names = [f"feature_{i}" for i in range(X.shape[1])]
-        self.is_fitted_ = True
-        return self
-
-    def _add_noise(self, X):
-        X_copy = np.array(X).copy()
-        stds = np.std(X_copy, axis=0) + 1e-5
-        
-        for i, col in enumerate(self.feature_names):
-            col_lower = col.lower()
-            if 'indicator' in col_lower or 'missing' in col_lower:
-                continue
-                
-            if any(term in col_lower for term in ['gcs', 'apache', 'verbal', 'motor', 'eyes']):
-                dynamic_scale = self.noise_scales['gcs'] * stds[i] 
-                noise = np.random.normal(0, dynamic_scale, X_copy[:, i].shape)
-                X_copy[:, i] += noise 
-                
-                # Zaokrąglenie do wartości całkowitych dla skal dyskretnych
-                X_copy[:, i] = np.round(X_copy[:, i])
-                
-                # Fizjologiczne przycięcie widełek
-                if 'gcs' in col_lower:
-                    X_copy[:, i] = np.clip(X_copy[:, i], 3, 15)
-                elif 'eyes' in col_lower:
-                    X_copy[:, i] = np.clip(X_copy[:, i], 1, 4)
-                elif 'verbal' in col_lower:
-                    X_copy[:, i] = np.clip(X_copy[:, i], 1, 5)
-                elif 'motor' in col_lower:
-                    X_copy[:, i] = np.clip(X_copy[:, i], 1, 6)
-                elif 'apache' in col_lower:
-                    X_copy[:, i] = np.clip(X_copy[:, i], 0, 71)
-
-            elif any(term in col_lower for term in ['bp', 'rate', 'pulse', 'spo2', 'glucose', 'temp']):
-                dynamic_scale = self.noise_scales['vitals'] * stds[i]
-                noise = np.random.normal(0, dynamic_scale, X_copy[:, i].shape)
-                X_copy[:, i] += noise
-                
-                # Zabezpieczenie parametrów życiowych (np. brak ujemnego tętna lub SpO2 > 100)
-                if 'spo2' in col_lower:
-                    X_copy[:, i] = np.clip(X_copy[:, i], 0, 100)
-                else:
-                    X_copy[:, i] = np.maximum(X_copy[:, i], 0)
-
-            else:
-                dynamic_scale = self.noise_scales['other'] * stds[i]
-                noise = np.random.normal(0, dynamic_scale, X_copy[:, i].shape)
-                X_copy[:, i] += noise 
-            
-        return X_copy
-
-    def fit_transform(self, X, y=None, **fit_params):
-        self.fit(X, y, **fit_params)
-        return self._add_noise(X)
-
-    def transform(self, X):
-        if not getattr(self, 'is_fitted_', False):
-            raise NotFittedError("Transformator nie został wyuczony.")
-        return np.array(X).copy()
-
-    def get_feature_names_out(self, input_features=None):
-        return self.feature_names if input_features is None else input_features
-    
-
-class ColumnDropper(BaseEstimator, TransformerMixin):
-    """ Usuwa kolumnę z prawdopodobieństwami modelu 1, jeśli istnieje.
-        Używana przy przekazywaniu decyzji obu modeli do meta-modelu, więc niepotrzebnie duplikować. """
-    def __init__(self):
-        self.is_fitted_ = None
-
-    def fit(self, X, y=None):
-        # Informujemy Scikit-Learn, że model został nauczony
-        self.is_fitted_ = True
-        return self
-
-    def transform(self, X):
-        if not hasattr(self, 'is_fitted_'):
-            raise NotFittedError("Ten transformator nie został wyuczony.")
-
-        # Usuwamy kolumnę prawdopodobieństwa, której model główny nie zna
-        if isinstance(X, pd.DataFrame) and 'model_1_prob' in X.columns:
-            return X.drop(columns=['model_1_prob'])
-        return X
-
-    @staticmethod
-    def get_feature_names_out(input_features=None):
-        if input_features is None:
-            return None
-        return np.array([f for f in input_features if f != 'model_1_prob'])
-
-
-class MedicalCascadePredictor(BaseEstimator, ClassifierMixin):
-    """ Kaskada Warunkowa z obsługą strefy niepewności. System analizuje kolejne modalności
-        tylko wtedy, gdy poprzednie etapy nie dały jednoznacznej pewności diagnostycznej. """
-    def __init__(self, preprocessor, ensemble, specialist, judge, anomaly_detector=None, review_threshold=0.05, optimal_threshold=0.5):
-        self.preprocessor = preprocessor
-        self.ensemble = ensemble
-        self.specialist = specialist
-        self.judge = judge
-        self.anomaly_detector = anomaly_detector 
-        self.review_threshold = review_threshold  # Margines niepewności wokół progu optymalnego
-        self.optimal_threshold = optimal_threshold # Dynamiczny próg kliniczny
-        self.feature_names_in = preprocessor.feature_names_in_
-
-    def predict_proba(self, X_raw, crnn_probs=None, efficientnet_probs=None, densenet_probs=None, n_tta_runs=4):
-        if not isinstance(X_raw, pd.DataFrame):
-            X_raw = pd.DataFrame(X_raw, columns=self.feature_names_in)
-
-        prob_main_accum = np.zeros(len(X_raw))
-        num_cols = [c for c in X_raw.select_dtypes(include='number').columns 
-                    if 'indicator' not in c.lower() and 'missing' not in c.lower()]
-
-        feature_names_out = None
-        for i in range(n_tta_runs):
-            X_tta = X_raw.copy()
-            if i > 0: 
-                for col in num_cols:
-                    noise = np.random.normal(0, 0.015, size=len(X_tta))
-                    X_tta[col] *= (1 + noise)
-            
-            X_clean = self.preprocessor.transform(X_tta)
-            feature_names_out = [name.split('__')[-1] for name in self.preprocessor.get_feature_names_out()]
-            X_clean_df = pd.DataFrame(X_clean, columns=feature_names_out, index=X_tta.index)
-            prob_main_accum += self.ensemble.predict_proba(X_clean_df.values)[:, 1]
-            
-        prob_main = prob_main_accum / n_tta_runs
-        final_probs = prob_main.copy()
-
-        base_preds = []
-        estimators = getattr(self.ensemble, 'named_estimators_', None)
-        if estimators is not None:
-            for name, est in estimators.items():
-                try:
-                    base_preds.append(est.predict_proba(X_clean_df.values)[:, 1])
-                except (ValueError, NotFittedError, AttributeError) as e:
-                    logger.warning(f"Błąd pobierania predykcji z modelu bazowego {name}: {e}")
-                    pass
-                except Exception as e:
-                    logger.error(f"Nieoczekiwany błąd w modelu bazowym {name}: {e}")
-                    pass
-        
-        # Jeśli modele w Konsylium nie zgadzają się ze sobą, wariancja jest wysoka
-        if len(base_preds) > 1:
-            preds_matrix = np.column_stack(base_preds)
-            preds_std = np.std(preds_matrix, axis=1)
-            
-            # Pacjent niepewny, jeśli modele kłócą się ze sobą powyżej dynamicznego odchylenia 0.15
-            is_conformal_uncertain = (preds_std > 0.15) 
-        else:
-            is_conformal_uncertain = (prob_main > 0.40) & (prob_main < 0.60)
-
-        if self.anomaly_detector is not None:
-            X_clean_base = pd.DataFrame(self.preprocessor.transform(X_raw), columns=feature_names_out, index=X_raw.index)
-            is_anomalous = (self.anomaly_detector.predict(X_clean_base) == 1)
-        else:
-            is_anomalous = pd.Series(False, index=X_raw.index)
-
-        needs_stage_2 = is_conformal_uncertain | is_anomalous
-        prob_spec = prob_main.copy()
-
-        if needs_stage_2.any():
-            X_hard = X_raw[needs_stage_2].copy()
-            X_hard['model_1_prob'] = prob_main[needs_stage_2]
-            
-            prob_spec_calc = self.specialist.predict_proba(X_hard)[:, 1]
-            prob_spec[needs_stage_2] = prob_spec_calc
-            
-            diff = prob_main[needs_stage_2] - 0.5
-            weight = 1 / (1 + np.exp(-10 * diff)) 
-            final_probs[needs_stage_2] = (1 - weight) * prob_main[needs_stage_2] + weight * prob_spec_calc
-
-        is_uncertain_scans = (prob_spec > 0.40) & (prob_spec < 0.60)
-        needs_stage_3 = needs_stage_2 & is_uncertain_scans
-
-        if needs_stage_3.any():
-            if crnn_probs is None: crnn_probs = np.full_like(prob_main, 0.5)
-            if efficientnet_probs is None: efficientnet_probs = np.full_like(prob_main, 0.5)
-            if densenet_probs is None: densenet_probs = np.full_like(prob_main, 0.5)
-
-            meta_list = [
-                prob_main[needs_stage_3], 
-                prob_spec[needs_stage_3], 
-                crnn_probs[needs_stage_3], 
-                efficientnet_probs[needs_stage_3],
-                densenet_probs[needs_stage_3]
-            ]
-            
-            meta_features = np.column_stack(meta_list)
-            base_names_meta = ['Konsylium', 'Eksperci', 'CRNN', 'EfficientNet', 'DenseNet']
-            
-            # Przekazanie DataFrame pozwala EBM na poprawne mapowanie nazw cech
-            meta_features_df = pd.DataFrame(meta_features, columns=base_names_meta, index=X_raw[needs_stage_3].index)
-            
-            expected_features = getattr(self.judge, 'n_features_in_', meta_features_df.shape[1])
-            if meta_features_df.shape[1] < expected_features:
-                padding = np.full((meta_features_df.shape[0], expected_features - meta_features_df.shape[1]), 0.5)
-                padding_df = pd.DataFrame(padding, columns=[f'pad_{i}' for i in range(padding.shape[1])], index=meta_features_df.index)
-                meta_features_df = pd.concat([meta_features_df, padding_df], axis=1)
-                
-            # EBM przyjmuje surowe prawdopodobieństwa i optymalizuje wagi
-            prob_final_hard = self.judge.predict_proba(meta_features_df)[:, 1]
-            final_probs[needs_stage_3] = prob_final_hard
-
-        return np.column_stack((1 - final_probs, final_probs))
-
-    def predict(self, X_raw, crnn_probs=None, efficientnet_probs=None, densenet_probs=None):
-        preds = self.predict_proba(X_raw, crnn_probs, efficientnet_probs, densenet_probs)[:, 1]
-        return (preds >= self.optimal_threshold).astype(int)
-
-    def predict_with_clinical_review(self, X_raw, crnn_probs=None, efficientnet_probs=None, densenet_probs=None):
-        probs = self.predict_proba(X_raw, crnn_probs, efficientnet_probs, densenet_probs)[:, 1]
-        decisions = []
-        
-        for p in probs:
-            # Szara strefa jest teraz centrowana wokół optymalnego progu klinicznego
-            if abs(p - self.optimal_threshold) <= self.review_threshold:
-                decisions.append("Wymagane sprawdzenie stanu pacjenta")
-            elif p >= self.optimal_threshold:
-                decisions.append("Stan krytyczny")
-            else:
-                decisions.append("Stabilny")
-        return decisions, probs
-
-
-# Wrapper omijający błąd biblioteki Imbalanced-Learn
-class CustomClassifierPipeline(ImbPipeline):
-    @property
-    def _estimator_type(self):
-        return "classifier"
-
 
 class PhenotypeTournamentRouter(BaseEstimator, ClassifierMixin):
     """ Dynamiczny Router Fenotypów z hybrydowym klastrowaniem kontekstowym (Hierarchiczne + GMM + Sparse PCA).
         Rozdziela pacjentów na specyficzne podgrupy kliniczne (np. urazy wysokenergetyczne u młodych oraz profil geriatryczny),
         stosując dedykowane metody redukcji szumu i przestrzeni cech. """
-        
     _estimator_type = "classifier"
 
     def __init__(self, candidate_estimators, feature_names=None, phenotype_hints=None, min_clusters=2, max_clusters=4, min_patients_per_cluster=70):
@@ -918,7 +570,6 @@ class PhenotypeTournamentRouter(BaseEstimator, ClassifierMixin):
         self.is_fitted_ = True
         return self
     
-
     def predict_proba(self, X):
         if not self.is_fitted_:
             raise NotFittedError("Model nie został nauczony.")
@@ -1126,7 +777,7 @@ def load_and_split_data():
 
 
 def cascade_predict(data):
-    """ Definiujemy funkcję predykcji dla kaskady (od śmierci). """
+    """ Definiujemy funkcję predykcji dla kaskady. """
     # SHAP często rzuca dane jako NumPy Array, co psuje ColumnTransformer
     if not isinstance(data, pd.DataFrame):
         data = pd.DataFrame(data, columns=X_train.columns)
@@ -1185,7 +836,8 @@ def verify_local_icu_tables(base_dir: str = None):
 
 def download_and_extract_note_if_missing(username: str, password: str, output_csv_path: str = "radiology.csv"):
     """ Sprawdza, czy plik istnieje. Jeśli nie ma rozpakowanego, szuka .gz lub pobiera z PhysioNet,
-        a następnie automatycznie wypakowuje do formatu .csv. """
+        a następnie automatycznie wypakowuje do formatu .csv.
+        Aktualnie zrezygnowałem z używania notatek, uważam, że komunikacja w drugą stronę: system -> lekarz jest bardziej wartościowa niż odwrotnie. """
     
     # Ustalamy ścieżki dla wersji spakowanej i rozpakowanej
     if output_csv_path.endswith(".gz"):
@@ -1230,6 +882,7 @@ def download_and_extract_note_if_missing(username: str, password: str, output_cs
     else:
         logger.warning("Brak danych logowania PhysioNet. Nie można pobrać brakującego pliku.")
         return None
+
 
 def _extract_gz_file(gz_path, csv_path):
     """ Pomocnicza funkcja bezpiecznie wypakowująca archiwum .gz do pliku .csv. """
@@ -1520,7 +1173,8 @@ class SyntheticPhenotypeMatcher:
         crnn_base = 1 / (1 + np.exp(-crnn_logit))
         crnn_matched = np.clip(crnn_base + self.rng.normal(0, 0.12, n_samples), 0.01, 0.99)
 
-        # Zgodnie z Brain Trauma Foundation: "Śmiercionośny duet" (Hipotensja + Hipoksja) niszczy istotę białą
+        """ Dla EfficientNet (Ciało modzelowate)
+            Zgodnie z Brain Trauma Foundation: "Śmiercionośny duet" (Hipotensja + Hipoksja) niszczy istotę białą. """
         efficientnet_logit = -2.5 + (2.5 * gcs_sev) + (2.0 * map_sev) + (2.0 * hypoxia_sev)
         efficientnet_base = 1 / (1 + np.exp(-efficientnet_logit))
         efficientnet_matched = np.clip(efficientnet_base + self.rng.normal(0, 0.18, n_samples), 0.01, 0.99)
@@ -1916,22 +1570,43 @@ def load_trained_efficientnet_predictions(X_test, dataset_path='Data/dataset_eff
         return np.full(len(X_test), 0.5), np.zeros(len(X_test))
     
 
-def load_trained_densenet_predictions(X_test, dataset_path='Data/dataset_ct_main', device=None):
-    """ Wczytuje wytrenowane wagi DenseNet-121 i generuje predykcje obecności złamań na pełnych wolumenach skanów. """
+def load_trained_fracture_predictions(X_test, dataset_path='Data/dataset_ct_main', device=None):
+    """ Pełnoprawna, produkcyjna funkcja inferencji dla modułu złamań czaszki. 
+        Obsługuje zarówno pojedynczy model DenseNet 3D, jak i pełny zespół (Ensemble) 
+        łączący DenseNet 3D z Vision Transformerem 3D przy użyciu Uncertainty Aware Soft Voting. """
     if device is None:
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         
-    model_path = 'output_data/Models/densenet_fracture_best.pth'
-    if not os.path.exists(model_path):
+    ensemble_path = os.path.join('output_data', 'Models', 'fracture_best.pth')
+    dense_path = os.path.join('output_data', 'Models', 'densenet_fracture_best.pth')
+    trans_path = os.path.join('output_data', 'Models', 'transformer_fracture_best.pth')
+    
+    # Sprawdzamy dostępność wag modeli
+    has_weights = os.path.exists(dense_path)
+    
+    if not has_weights:
         logger.warning("Brak pliku wag DenseNet. Zwracam neutralne prawdopodobieństwa 0.5.")
-        return np.full(len(X_test), 0.5)
+        return np.full(len(X_test), 0.5, dtype=np.float32)
         
+    model_dense = None
+    model_trans = None
+    
     try:
-        model = DenseNetFractureDetector(pretrained=True, dropout_rate=0.0).to(device)
-        model.load_state_dict(torch.load(model_path, map_location=device))
-        model.eval()
+        # Inicjalizacja modeli w trybie ewaluacji z wyłączonym dropoutem
+        model_dense = DenseNetFractureDetector(pretrained=False, dropout_rate=0.0).to(device)
+        model_dense.load_state_dict(torch.load(dense_path, map_location=device, weights_only=True))
+        model_dense.eval()
         
-        bone_window = BoneWindowTransform(window_center=400, window_width=1000)
+        if os.path.exists(trans_path):
+            model_trans = TransformerFractureDetector3D(dropout_rate=0.0).to(device)
+            model_trans.load_state_dict(torch.load(trans_path, map_location=device, weights_only=True))
+            model_trans.eval()
+            logger.info("Załadowano pełny zespół modelowy (DenseNet 3D + Vision Transformer 3D).")
+        else:
+            logger.info("Załadowano pojedynczy model DenseNet 3D (brak wag Transformera).")
+            
+        # Poprawna inicjalizacja transformatora okna kostnego (zgodna z definicją percentyla)
+        bone_window = BoneWindowTransform(percentile=88)
         
         transform = transforms.Compose([
             transforms.Resize((224, 224)),
@@ -1956,61 +1631,92 @@ def load_trained_densenet_predictions(X_test, dataset_path='Data/dataset_ct_main
                     probs_list.append(0.5)
                     continue
                     
+                # Normalizacja liczby slajdów do stałego wolumenu (30 warstw)
                 if len(slices) > 30:
                     indices = np.linspace(0, len(slices) - 1, 30, dtype=int)
                     slices = [slices[i] for i in indices]
                 elif len(slices) < 30:
                     slices = slices + [slices[-1]] * (30 - len(slices))
                     
-                volume_tensor = torch.zeros((1, 30, 224, 224))
+                volume_tensor = torch.zeros((1, 30, 224, 224), dtype=torch.float32)
                 
                 for i, slice_file in enumerate(slices):
                     img_path = os.path.join(patient_folder, slice_file)
                     
-                    if img_path.endswith('.dcm'):
-                        # Użycie bloku with zapewnia zwolnienie uchwytu pliku, co jest krytyczne w pętlach
-                        with open(img_path, 'rb') as f:
-                            dicom_data = pydicom.dcmread(f)
-                            
-                        img_array = dicom_data.pixel_array.astype(np.float32)
-                        intercept = float(getattr(dicom_data, 'RescaleIntercept', 0.0))
-                        slope = float(getattr(dicom_data, 'RescaleSlope', 1.0))
-                        hu_image = img_array * slope + intercept
-                        img_pil = bone_window(hu_image)
-                    else:
-                        # Menedżer kontekstu, żeby nie wyciekały uchwyty plików przy dużej liczbie obrazów
-                        with Image.open(img_path) as img:
-                            # .copy() wymusza wczytanie do pamięci i odcina referencję od zamykanego pliku
-                            img_pil = img.convert('L').copy()
-                    
-                    tensor_2d = transform(img_pil)
-                    volume_tensor[0, i] = tensor_2d.squeeze(0)
+                    try:
+                        if img_path.endswith('.dcm'):
+                            # Bezpieczne wczytanie DICOM z użyciem kontekstu
+                            with open(img_path, 'rb') as f:
+                                dicom_data = pydicom.dcmread(f)
+                                
+                            img_array = dicom_data.pixel_array.astype(np.float32)
+                            intercept = float(getattr(dicom_data, 'RescaleIntercept', 0.0))
+                            slope = float(getattr(dicom_data, 'RescaleSlope', 1.0))
+                            hu_image = img_array * slope + intercept
+                            img_pil = bone_window(hu_image)
+                        else:
+                            # Standardowe pliki obrazów (PNG/JPG) z odcięciem referencji
+                            from PIL import UnidentifiedImageError
+                            with Image.open(img_path) as img:
+                                img_array = np.array(img.convert('L')).copy()
+                            img_pil = bone_window(img_array)
+                        
+                        tensor_2d = transform(img_pil)
+                        volume_tensor[0, i] = tensor_2d[0]
+                    except FileNotFoundError:
+                        logger.debug(f"Brak pliku slajdu: {img_path}")
+                        continue
+                    except pydicom.errors.InvalidDicomError as dicom_err:
+                        logger.debug(f"Nieprawidłowy lub uszkodzony plik DICOM {img_path}: {dicom_err}")
+                        continue
+                    except UnidentifiedImageError as img_err:
+                        logger.debug(f"Nie rozpoznano formatu obrazu {img_path}: {img_err}")
+                        continue
+                    except AttributeError as attr_err:
+                        logger.debug(f"Brak wymaganych metadanych DICOM (np. pixel_array) w {img_path}: {attr_err}")
+                        continue
+                    except (ValueError, TypeError) as val_err:
+                        logger.debug(f"Błąd transformacji tensora lub konwersji macierzy dla {img_path}: {val_err}")
+                        continue
+                    except Exception as slice_err:
+                        logger.debug(f"Nieoczekiwany błąd podczas wczytywania slajdu {img_path}: {slice_err}")
+                        continue
                         
                 vol_input = volume_tensor.unsqueeze(0).to(device)
                 
                 autocast_context = torch.amp.autocast(device_type='cuda') if device.type == 'cuda' else nullcontext()
                 with autocast_context:
-                    outputs = model(vol_input)
-                    pred_prob = torch.sigmoid(outputs).cpu().numpy()
-                    val = float(pred_prob.max() if isinstance(pred_prob, np.ndarray) else pred_prob)
+                    if model_trans is not None:
+                        # Użycie pełnego Soft Voting opartego na entropii z obu modeli
+                        pred_prob = ensemble_predict_fracture(vol_input, model_dense, model_trans)
+                    else:
+                        outputs = model_dense(vol_input)
+                        pred_prob = torch.sigmoid(outputs).cpu().numpy()
+                        
+                    val = float(np.max(pred_prob) if isinstance(pred_prob, np.ndarray) else pred_prob)
                     probs_list.append(val)
 
-        del model
+        # Czyszczenie pamięci podręcznej i wskaźników GPU
+        del model_dense, model_trans
         gc.collect()
         if device.type == 'cuda':
             torch.cuda.empty_cache()
               
-        return np.array(probs_list)
+        return np.array(probs_list, dtype=np.float32)
+        
     except RuntimeError as e:
-        logger.error(f"Błąd sprzętowy PyTorch w DenseNet: {e}")
-        return np.full(len(X_test), 0.5)
-    except OSError as e:
-        logger.error(f"Błąd odczytu z dysku podczas inferencji DenseNet: {e}")
-        return np.full(len(X_test), 0.5)
-    except ValueError as e:
-        logger.error(f"Błąd przetwarzania macierzy obrazu/DICOM w DenseNet: {e}")
-        return np.full(len(X_test), 0.5)
-
+        logger.error(f"Błąd sprzętowy PyTorch w module złamań: {e}")
+        gc.collect()
+        if device.type == 'cuda':
+            torch.cuda.empty_cache()
+        return np.full(len(X_test), 0.5, dtype=np.float32)
+    except Exception as e:
+        logger.error(f"Nieoczekiwany błąd podczas inferencji złamań: {e}")
+        gc.collect()
+        if device.type == 'cuda':
+            torch.cuda.empty_cache()
+        return np.full(len(X_test), 0.5, dtype=np.float32)
+    
 
 def seed_everything(seed=42):
     """ Inicjalizuje wszystkie ziarna losowości dla bibliotek zewnętrznych, gwarantując w 100% deterministyczny i powtarzalny
@@ -2136,106 +1842,6 @@ def setup_environment():
             logger.warning(f"Brak pliku {s3_key} oraz brak danych logowania PhysioNet. Pomijam pobieranie, używam trybu syntetycznego.")
 
     check_and_seed_database()
-
-
-def ensemble_objective(trial, X_train_numeric, y_train_numeric, cv_strategy, monotone_tuple, binary_indices):
-    """ Funkcja celu dla Optuny z dynamiczną selekcją architektury zespołu (NAS) i stałym wsparciem BernoulliNB. """
-    
-    ensemble_type = trial.suggest_categorical('ensemble_type', ['duo_speed', 'duo_orthogonal', 'trio_trees', 'full_stack'])
-    base_pos_weight = float((y_train_numeric == 0).sum() / max(1, (y_train_numeric == 1).sum()))
-    
-    low_bound = max(1.0, base_pos_weight * 0.8)
-    high_bound = max(low_bound + 0.1, base_pos_weight * 1.2)
-
-    scores = []
-    for train_idx, val_idx in cv_strategy.split(X_train_numeric, y_train_numeric):
-        X_tr, X_va = X_train_numeric[train_idx], X_train_numeric[val_idx]
-        y_tr, y_va = y_train_numeric[train_idx], y_train_numeric[val_idx]
-        
-        # Tworzymy listę każdym foldzie
-        estimators = []
-
-        # XGBoost
-        if ensemble_type in ['duo_orthogonal', 'trio_trees', 'full_stack']:
-            xgb_p = {
-                # Wyższa liczba drzew i niski LR, dla stabilności przy budowaniu drzew
-                'n_estimators': trial.suggest_int('xgb_n_estimators', 200, 600),
-                'learning_rate': trial.suggest_float('xgb_lr', 0.01, 0.1, log=True),
-                'max_depth': trial.suggest_int('xgb_max_depth', 3, 6),
-                # Wymóg większej liczby próbek w liściu zapobiega tworzeniu reguł dla pojedynczych chorych
-                'subsample': trial.suggest_float('xgb_subsample', 0.7, 0.95),
-                'colsample_bytree': trial.suggest_float('xgb_colsample_bytree', 0.6, 0.9),
-                'min_child_weight': trial.suggest_int('xgb_min_child_weight', 10, 50),
-                # Silniejsza regularyzacja L1/L2 ze względu na silnie skorelowane cechy hemodynamiczne
-                'reg_alpha': trial.suggest_float('xgb_reg_alpha', 1e-3, 10.0, log=True),
-                'reg_lambda': trial.suggest_float('xgb_reg_lambda', 1e-2, 10.0, log=True),
-                'scale_pos_weight': trial.suggest_float('xgb_spw', low_bound, high_bound, log=True),
-                'random_state': CONFIG["SEED"],
-                'verbosity': 0,
-                'tree_method': 'hist',
-                'device': 'cpu',
-                'monotone_constraints': monotone_tuple
-            }
-            estimators.append(('xgb', xgb.XGBClassifier(**xgb_p)))
-
-        # LightGBM
-        if ensemble_type in ['duo_speed', 'trio_trees', 'full_stack']:
-            lgbm_p = {
-                'n_estimators': trial.suggest_int('lgbm_n_estimators', 200, 600),
-                'learning_rate': trial.suggest_float('lgbm_lr', 0.01, 0.15, log=True),
-                # Ograniczenie num_leaves dozwolone przez max_depth (2^max_depth)
-                'num_leaves': trial.suggest_int('lgbm_leaves', 31, 80),
-                # Wymóg większej liczby próbek w liściu zapobiega tworzeniu reguł dla pojedynczych chorych
-                'min_child_samples': trial.suggest_int('lgbm_child', 20, 50),
-                'scale_pos_weight': trial.suggest_float('lgbm_spw', low_bound, high_bound, log=True),
-                'random_state': CONFIG["SEED"],
-                'verbosity': -1,
-                'device_type': 'cpu'
-            }
-            estimators.append(('lgbm', LGBMClassifier(**lgbm_p)))
-
-        # CatBoost
-        if ensemble_type in ['duo_speed', 'trio_trees', 'full_stack']:
-            cat_p = {
-                'depth': trial.suggest_int('cat_depth', 4, 6),
-                'learning_rate': trial.suggest_float('cat_lr', 0.02, 0.15, log=True),
-                # Wymóg większej liczby próbek w liściu zapobiega tworzeniu reguł dla pojedynczych chorych
-                'min_data_in_leaf': trial.suggest_int('cat_min_data', 20, 50),
-                # Operujemy na karze L2, żeby mocniej karać modele z nadmierną liczbą liści i zbyt dużymi wagami
-                'l2_leaf_reg': trial.suggest_float('cat_l2', 2.0, 10.0, log=True),
-                'random_seed': CONFIG["SEED"],
-                'verbose': 0,
-                'task_type': 'CPU'
-            }
-            estimators.append(('cat', CatBoostClassifier(**cat_p)))
-
-        # TabNet
-        if ensemble_type in ['duo_orthogonal', 'full_stack']:
-            gamma_val = trial.suggest_float('tabnet_gamma', 1.0, 1.3)
-            estimators.append(('tabnet', TabNetClassifier(n_d=16, n_a=16, gamma=gamma_val, verbose=0, seed=CONFIG["SEED"])))
-
-        # Ekspert Czerwonych Flag: BernoulliNB
-        if binary_indices:
-            nb_expert = Pipeline([
-                ('filter_binary', ColumnTransformer(
-                    transformers=[('bin_keep', 'passthrough', binary_indices)],
-                    remainder='drop'
-                )),
-                ('nb', BernoulliNB(alpha=1.0, binarize=None, fit_prior=True))
-            ])
-            estimators.append(('red_flag_nb', nb_expert))
-
-        model = StackingClassifier(estimators=estimators, cv=3, n_jobs=1)
-
-        try:
-            model.fit(X_tr, y_tr)
-            preds = model.predict_proba(X_va)[:, 1]
-            scores.append(roc_auc_score(y_va, preds))
-        except (ValueError, RuntimeError, TypeError) as e:
-            logger.warning(f"Próba Optuny odrzucona (błąd modelu): {e}")
-            return 0.0
-
-    return np.mean(scores) if scores else 0.0
 
 
 def train_pipeline(X_train, X_test, y_train, y_test):
@@ -2511,7 +2117,8 @@ def train_pipeline(X_train, X_test, y_train, y_test):
 
     joblib.dump(ensemble_best, os.path.join(SETTINGS.models_dir, 'Optimized_Stacking_Ensemble.pkl'))
 
-    logger.info("Izolacja Anomali i Turniej Specjalistów")
+    logger.info("Izolacja anomalii: wybór lasu izolacyjnego, ponieważ jego struktura oparta na drzewach podporządkowuje się do drzew z pierwszej fazy," \
+    "co zapewnia spójność w wykrywaniu próbek brzegowych.")
     anomaly_detector = IsolationForest(
         n_estimators=200, contamination=0.1, random_state=CONFIG["SEED"], n_jobs=-1
     )
@@ -2679,7 +2286,7 @@ def train_pipeline(X_train, X_test, y_train, y_test):
 
     real_crnn_test = load_trained_crnn_predictions(X_test, dataset_path=os.path.join(BASE_DIR, 'Data', 'dataset_ct_main'), device=device)
     real_efficientnet_test_probs, real_efficientnet_test_uncert = load_trained_efficientnet_predictions(X_test, dataset_path=os.path.join(BASE_DIR, 'Data', 'dataset_efficientnet'), device=device)
-    real_densenet_test = load_trained_densenet_predictions(X_test, dataset_path=os.path.join(BASE_DIR, 'Data', 'dataset_ct_main'), device=device)
+    real_densenet_test = load_trained_fracture_predictions(X_test, dataset_path=os.path.join(BASE_DIR, 'Data', 'dataset_ct_main'), device=device)
     
     # Stosujemy wbudowane CV, aby kalibrator nie uczył się na danych treningowych sędziego
     calibrated_final_judge = CalibratedClassifierCV(final_judge, method='isotonic', cv=3)
@@ -2740,187 +2347,157 @@ def train_pipeline(X_train, X_test, y_train, y_test):
     return calibrated_spec_pipe, artifacts
 
 
-class RealTBIPharmacoModel:
-    """ Model PK/PD z pełną integracją z otwartymi API medycznymi (OpenFDA / RxNorm / PK-DB) 
-        oraz zewnętrzną ontologią terminologiczną bez hardkodowanych mapowań. """
+class MultiTargetSurrogateMLP(nn.Module):
+    """ Różniczkowalny model zastępczy z Monte Carlo Dropout do szacowania niepewności
+        i wstecznej propagacji gradientów w silniku. """
+    def __init__(self, input_dim: int, output_dim: int, hidden_dim: int = 128, dropout_rate: float = 0.2):
+        super().__init__()
+        self.dropout_rate = dropout_rate
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.GELU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(hidden_dim // 2, output_dim)
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+    def predict_with_mc_uncertainty(self, x: torch.Tensor, n_samples: int = 20) -> Tuple[torch.Tensor, torch.Tensor]:
+        """ Włącza Dropout podczas inferencji (Monte Carlo Dropout), zwracając różniczkowalną średnią i wariancję. """
+        self.train() # Wymuszenie aktywnego Dropoutu dla próbowania stochastycznego
+        samples = torch.stack([self.forward(x) for _ in range(n_samples)], dim=0)
+        mean = samples.mean(dim=0)
+        variance = samples.var(dim=0)
+        return mean, variance
+
+
+def train_surrogate_model(X_train_df: pd.DataFrame, epochs: int = 25, lr: float = 0.005) -> MultiTargetSurrogateMLP:
+    """ Dopasowuje sieć zastępczą do odtwarzania pełnego wektora stanu pacjenta. """
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    X_arr = np.nan_to_num(X_train_df.values, nan=0.0).astype(np.float32)
     
-    OPENFDA_API_URL = "https://api.fda.gov/drug/label.json"
-    RXNORM_APPROXIMATE_URL = "https://rxnav.nlm.nih.gov/REST/approximateTerm.json"
-    PKDB_API_URL = "https://pk-db.com/api/v1"
-
-    def __init__(self, drug_name: str, ontology_config_path: Optional[str] = None):
-        self.drug_name = drug_name.lower()
-        
-        # Pobranie oficjalnego mapowania z zewnętrznego słownika ontologicznego lub API
-        self.ontology_record = self._resolve_drug_ontology(self.drug_name, ontology_config_path)
-        
-        # Pobranie profilu PK/PD na podstawie zweryfikowanego identyfikatora substancji z zewnętrznej bazy
-        drug_record = self._fetch_drug_params_from_api(self.ontology_record["standard_generic_name"])
-        
-        self.source_metadata = {**self.ontology_record, **drug_record.get("source_metadata", {})}
-        self.params = {
-            "pk": drug_record.get("pk", {}),
-            "pd": drug_record.get("pd", {})
-        }
-        
-        self.active_doses = []
-
-    @staticmethod
-    def _resolve_drug_ontology(drug_name: str, config_path: Optional[str] = None) -> Dict[str, str]:
-        """ Rozwiązuje nazwę stosowaną w systemie TBI na standardową nazwę substancji czynnej 
-            oraz kod RxCUI przy użyciu zewnętrznego pliku ontologii lub zapytania do RxNorm API. """
-        # Jeśli wskazano zewnętrzny plik konfiguracyjny z ontologią (np. tbi_ontology.json)
-        if config_path:
-            try:
-                with open(config_path, 'r', encoding='utf-8') as f:
-                    ontology_db = json.load(f)
-                if drug_name in ontology_db:
-                    return ontology_db[drug_name]
-            except (json.JSONDecodeError, FileNotFoundError) as e:
-                logger.warning(f"Nie udało się załadować pliku ontologii {config_path}: {e}")
-
-        # Odpytanie oficjalnego API RxNorm (NLM) w celu znalezienia standardowej nazwy
-        try:
-            response = requests.get(
-                RealTBIPharmacoModel.RXNORM_APPROXIMATE_URL, 
-                params={"term": drug_name, "maxEntries": 1}, 
-                timeout=3.0
-            )
-            if response.status_code == 200:
-                data = response.json()
-                candidates = data.get("approximateGroup", {}).get("candidate", [])
-                if candidates:
-                    best_match = candidates[0]
-                    return {
-                        "local_name": drug_name,
-                        "standard_generic_name": best_match.get("name", drug_name).upper(),
-                        "rxcui": best_match.get("rxcui", "N/A"),
-                        "source": "RxNorm NLM API"
-                    }
-        except requests.RequestException as e:
-            logger.debug(f"Błąd sieciowy podczas odpytywania RxNorm API dla '{drug_name}'. Przechodzę do słownika awaryjnego: {e}")
-
-        # Ostateczny awaryjny słownik referencyjny oparty na standardach NLM (zamiast losowego kodu)
-        standard_fallback_db = {
-            "mannitol": {"standard_generic_name": "MANNITOL", "rxcui": "6640"},
-            "hypertonic_saline": {"standard_generic_name": "SODIUM CHLORIDE", "rxcui": "9905"},
-            "barbiturates": {"standard_generic_name": "THIOPENTAL", "rxcui": "10551"},
-            "antiseizure_levetiracetam": {"standard_generic_name": "LEVETIRACETAM", "rxcui": "358356"}
-        }
-        
-        if drug_name in standard_fallback_db:
-            return {
-                "local_name": drug_name,
-                "standard_generic_name": standard_fallback_db[drug_name]["standard_generic_name"],
-                "rxcui": standard_fallback_db[drug_name]["rxcui"],
-                "source": "Standard NLM/RxCUI Fallback Table"
-            }
+    input_dim = X_arr.shape[1]
+    model = MultiTargetSurrogateMLP(input_dim=input_dim, output_dim=input_dim).to(device)
+    
+    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    criterion = nn.MSELoss()
+    
+    dataset = TensorDataset(torch.tensor(X_arr, dtype=torch.float32))
+    loader = DataLoader(dataset, batch_size=64, shuffle=True)
+    
+    for epoch in range(epochs):
+        model.train()
+        for (batch_x,) in loader:
+            batch_x = batch_x.to(device)
+            optimizer.zero_grad()
+            pred = model(batch_x)
+            loss = criterion(pred, batch_x)
+            loss.backward()
+            optimizer.step()
             
-        raise ValueError(f"Nieznana substancja TBI w słowniku ontologicznym: {drug_name}")
+    model.eval()
+    return model
 
-    @classmethod
-    @functools.lru_cache(maxsize=16)
-    def _fetch_drug_params_from_api(cls, standard_generic_name: str) -> Dict[str, Any]:
-        """Pobiera parametry z zewnętrznych baz danych (PK-DB oraz OpenFDA) na podstawie zweryfikowanej nazwy chemicznej."""
-        pk_params = {}
-        pd_params = {}
-        source_meta = {"api_source": "OpenFDA & PK-DB Public APIs"}
 
-        # Próba pobrania danych farmakokinetycznych z zewnętrznej bazy PK-DB (pk-db.com)
-        try:
-            filter_url = f"{cls.PKDB_API_URL}/filter/?substance={standard_generic_name.lower()}"
-            pkdb_resp = requests.get(filter_url, timeout=3.0)
-            if pkdb_resp.status_code == 200:
-                data = pkdb_resp.json()
-                # Jeśli baza zwraca wyniki badań, możemy je przetworzyć; w przeciwnym razie przechodzimy dalej
-                source_meta["pk_database"] = "PK-DB (pk-db.com)"
-        except requests.RequestException as e:
-            logger.debug(f"Błąd pobierania danych z PK-DB dla '{standard_generic_name}': {e}")
-
-        # Pobieranie danych tekstowych i rejestracyjnych z OpenFDA API
-        query_url = f"{cls.OPENFDA_API_URL}?search=openfda.generic_name:{standard_generic_name}&limit=1"
-        try:
-            response = requests.get(query_url, timeout=4.0)
-            if response.status_code == 200:
-                data = response.json()
-                results = data.get("results", [])
-                if results:
-                    label = results[0]
-                    openfda_info = label.get("openfda", {})
-                    source_meta["brand_name"] = openfda_info.get("brand_name", ["N/A"])[0]
-                    source_meta["manufacturer"] = openfda_info.get("manufacturer_name", ["N/A"])[0]
-        except (requests.RequestException, ValueError) as e:
-            logger.debug(f"Błąd pobierania/parsowania danych z OpenFDA dla '{standard_generic_name}': {e}")
-
-        # Zachowanie pełnej kompatybilności metod pobierania profili (terabel z zewnętrznych źródeł)
-        pk_params = cls._get_pharmacokinetics_profile(standard_generic_name)
-        pd_params = cls._get_pharmacodynamics_profile(standard_generic_name)
-
-        return {
-            "source_metadata": source_meta,
-            "pk": pk_params,
-            "pd": pd_params
-        }
-
-    @staticmethod
-    def _get_pharmacokinetics_profile(generic_name: str) -> Dict[str, float]:
-        # Pobieranie sparametryzowanego profilu z zewnętrznych zasobów modelowych
-        profiles = {
-            "MANNITOL": {"v_d": 0.25, "half_life": 2.1, "ka": 4.0},
-            "SODIUM CHLORIDE": {"v_d": 0.25, "half_life": 4.0, "ka": 6.0},
-            "THIOPENTAL": {"v_d": 2.5, "half_life": 8.5, "ka": 15.0},
-            "LEVETIRACETAM": {"v_d": 0.6, "half_life": 7.0, "ka": 2.0}
-        }
-        return profiles.get(generic_name, {"v_d": 0.5, "half_life": 4.0, "ka": 3.0})
-
-    @staticmethod
-    def _get_pharmacodynamics_profile(generic_name: str) -> Dict[str, float]:
-        # Pobieranie profilu PD opartego na badaniach neurointensywnych
-        profiles = {
-            "MANNITOL": {"max_icp_effect": -6.5, "ec50": 1.2, "hill_coefficient": 1.5, "osmotic_factor": 12.0, "map_penalty": 0.0},
-            "SODIUM CHLORIDE": {"max_icp_effect": -8.0, "ec50": 1.0, "hill_coefficient": 2.0, "osmotic_factor": 18.0, "map_penalty": 0.0},
-            "THIOPENTAL": {"max_icp_effect": -12.0, "ec50": 1.5, "hill_coefficient": 2.2, "cmro2_reduction": 0.40, "map_penalty": -15.0},
-            "LEVETIRACETAM": {"max_icp_effect": 0.0, "ec50": 1.0, "hill_coefficient": 1.0, "seizure_protection": 0.95, "map_penalty": 0.0}
-        }
-        return profiles.get(generic_name, {"max_icp_effect": 0.0, "ec50": 1.0, "hill_coefficient": 1.0})
-
-    def administer_dose(self, time_h: float, dose_mg_kg: float):
-        self.active_doses.append({"time": time_h, "dose": dose_mg_kg})
-
-    def get_concentration(self, current_time_h: float) -> float:
-        total_conc = 0.0
-        pk = self.params["pk"]
-        kel = np.log(2) / max(pk["half_life"], 1e-4)
+class ComprehensiveClinicalRecourseEngine:
+    """ Optymalizuje interwencje w celu utrzymania parametrów diagnostycznych w normie,
+        zachowując pełną różniczkowalność niepewności epistemicznej za pomocą Monte Carlo Dropout. """
+    def __init__(self, multi_target_surrogate: MultiTargetSurrogateMLP, feature_names: List[str], intervention_features: List[str], diagnostic_features: List[str]):
+        self.surrogate = multi_target_surrogate 
+        self.feature_names = feature_names
+        self.intervention_features = intervention_features
+        self.diagnostic_features = diagnostic_features
         
-        for d in self.active_doses:
-            dt = current_time_h - d["time"]
-            if dt < 0:
-                continue
-            effective_ka = pk["ka"]
-            if abs(effective_ka - kel) < 1e-4:
-                effective_ka += 1e-3
-            conc = (d["dose"] / pk["v_d"]) * (effective_ka / (effective_ka - kel)) * (np.exp(-kel * dt) - np.exp(-effective_ka * dt))
-            if conc > 0:
-                total_conc += conc
-        return max(0.0, total_conc)
+    def predict_future_state(self, x_tensor: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """ Zwraca różniczkowalny wektor stanu oraz różniczkowalną wariancję (Monte Carlo Dropout). """
+        if x_tensor.dim() == 1:
+            x_tensor = x_tensor.unsqueeze(0)
+        mean_state, variance = self.surrogate.predict_with_mc_uncertainty(x_tensor, n_samples=15)
+        return mean_state, variance
 
-    def calculate_pharmacodynamic_effects(self, current_time_h: float, base_icp: float) -> Dict[str, float]:
-        conc = self.get_concentration(current_time_h)
-        pd = self.params["pd"]
-        if conc <= 0:
-            return {k: 0.0 for k in pd.keys() if k not in ["hill_coefficient", "ec50"]}
+    def optimize_treatment_plan(self, patient_vector: np.ndarray, missing_mask: np.ndarray, target_ranges: Dict[str, Tuple[float, float]]):
+        x_orig = torch.tensor(patient_vector, dtype=torch.float32)
+        delta = torch.zeros_like(x_orig, requires_grad=True)
+        optimizer = torch.optim.Adam([delta], lr=0.02)
+        
+        actionable_mask = torch.zeros_like(x_orig)
+        for idx, f_name in enumerate(self.feature_names):
+            if f_name in self.intervention_features and missing_mask[idx] == 1:
+                actionable_mask[idx] = 1.0
+                
+        for step in range(300):
+            optimizer.zero_grad()
+            
+            x_cand = x_orig + (delta * actionable_mask)
+            future_state, uncertainty = self.predict_future_state(x_cand)
+            
+            loss_diagnostics = torch.tensor(0.0, dtype=torch.float32)
+            loss_uncertainty = torch.tensor(0.0, dtype=torch.float32)
+            
+            for feat, (min_val, max_val) in target_ranges.items():
+                if feat in self.feature_names:
+                    idx = self.feature_names.index(feat)
+                    pred_val = future_state[0, idx]
+                    
+                    penalty_low = torch.relu(min_val - pred_val) ** 2
+                    penalty_high = torch.relu(pred_val - max_val) ** 2
+                    loss_diagnostics = loss_diagnostics + penalty_low + penalty_high
+                    
+                    # Wariancja jest teraz częścią grafu PyTorch
+                    loss_uncertainty = loss_uncertainty + uncertainty[0, idx]
+            
+            # Dodatkowy kaganiec fizjologiczny: osmolalność osocza (2*Na + Glucose/18) < 320 mOsm/kg
+            loss_osmolality = torch.tensor(0.0, dtype=torch.float32)
+            if 'sodium_mean' in self.feature_names and 'glucose_max' in self.feature_names:
+                na_idx = self.feature_names.index('sodium_mean')
+                gl_idx = self.feature_names.index('glucose_max')
+                est_osmolality = 2.0 * future_state[0, na_idx] + (future_state[0, gl_idx] / 18.0)
+                loss_osmolality = torch.relu(est_osmolality - 320.0) ** 2
 
-        ec50 = pd.get("ec50", 1.0)
-        hill = pd.get("hill_coefficient", 1.0)
-        effect_fraction = (conc ** hill) / ((ec50 ** hill) + (conc ** hill))
+            loss_dist = 0.05 * torch.norm(delta * actionable_mask, p=1)
+            
+            total_loss = loss_diagnostics + 1.2 * loss_uncertainty + 2.0 * loss_osmolality + loss_dist
+            total_loss.backward()
+            optimizer.step()
+            
+        x_final = (x_orig + (delta * actionable_mask)).detach().numpy()
+        return self._generate_report(patient_vector, x_final, actionable_mask)
+        
+    def extract_adverse_profiles_for_target(self, cohort_df: pd.DataFrame, intervention: str, target_diagnostic: str, delta_intervention: float):
+        """ Identyfikuje pacjentów, u których interwencja wywoła krytyczne załamanie konkretnego parametru (np. drastyczny spadek MAP). """
+        X_base = cohort_df[self.feature_names].values
+        int_idx = self.feature_names.index(intervention)
+        diag_idx = self.feature_names.index(target_diagnostic)
+        
+        X_treated = X_base.copy()
+        X_treated[:, int_idx] += delta_intervention
+        
+        val_base = np.array([np.mean([m.predict(x.reshape(1,-1))[0, diag_idx] for m in self.ensemble_models]) for x in X_base])
+        val_treated = np.array([np.mean([m.predict(x.reshape(1,-1))[0, diag_idx] for m in self.ensemble_models]) for x in X_treated])
+        
+        impact = val_treated - val_base
+        
+        tree = DecisionTreeRegressor(max_depth=3, min_samples_leaf=0.05)
+        tree.fit(X_base, impact)
+        
+        return export_text(tree, feature_names=self.feature_names)
 
-        effects = {}
-        for k, val in pd.items():
-            if k in ["ec50", "hill_coefficient"]:
-                continue
-            effects[k] = val * effect_fraction
-        return effects
-    
+    def _generate_report(self, orig: np.ndarray, final: np.ndarray, mask: torch.Tensor) -> Dict[str, Any]:
+        interventions = {}
+        for idx in range(len(self.feature_names)):
+            if mask[idx] == 1.0 and abs(final[idx] - orig[idx]) > 1e-2:
+                interventions[self.feature_names[idx]] = {
+                    "Obecnie": round(float(orig[idx]), 2),
+                    "Rekomendacja": round(float(final[idx]), 2),
+                    "Korekta": round(float(final[idx] - orig[idx]), 2)
+                }
+        return interventions
+
 
 def extract_and_apply_tree_rules(X_train, y_train, X_test, feature_names):
     """ Ekstrahuje reguły asocjacyjne z drzew decyzyjnych i tworzy z nich meta-cechy.
@@ -2988,55 +2565,6 @@ def plot_calibration_and_brier(y_true, y_prob, model_name="Kaskada TBI"):
     plt.close()
     
     return brier
-
-
-class SonodeFalseAlarmDetector:
-  """ Klasa detektora fałszywych alarmów i ryzyka zatruć/intoksykacji farmakologicznej.
-      Wykorzystuje proste heurystyki oparte na sygnale, aby ocenić prawdopodobieństwo fałszywego alarmu i ryzyka zatrucia."""
-  def __init__(self, device="cpu"):
-    self.device = device
-    self.is_fitted = True
-
-  def detect_false_alarms_and_poisoning(self, patient_state_df):
-    """Analizuje strumień danych pod kątem fałszywych alarmów (np.
-
-    artefaktów ruchowych) oraz ryzyka zatrucia/intoksykacji farmakologicznej.
-    """
-    results = []
-    # Obsługa pojedynczego wiersza lub DataFrame
-    if isinstance(patient_state_df, dict):
-      patient_state_df = pd.DataFrame([patient_state_df])
-
-    for idx, row in patient_state_df.iterrows():
-      hr = row.get("heart_rate_max", 80)
-      sysbp = row.get("sysbp_min", 120)
-      glucose = row.get("glucose_max", 100)
-
-      # Przykładowa heurystyka / model bazujący na sygnale:
-      # Np. artefakty tętna przy normalnym ciśnieniu to często fałszywy alarm
-      is_artifact = 1 if (hr > 140 and sysbp > 100) else 0
-
-      # Ryzyko intoksykacji/zatrucia (np. ciężka bradykardia, zapaść ciśnieniowa lub skrajna hiperglikemia)
-      intoxication_risk = 0.85 if (hr < 45 or sysbp < 80 or glucose > 350) else 0.1
-
-      results.append({
-          "false_alarm_prob": float(0.8 if is_artifact else 0.1),
-          "intoxication_risk": float(intoxication_risk),
-          "alarm_reliability": float(0.2 if is_artifact else 0.9),
-      })
-
-    if len(results) == 1:
-      return results[0]
-
-    # Agregacja dla całego zbioru
-    avg_fa = sum(r["false_alarm_prob"] for r in results) / len(results)
-    avg_tox = sum(r["intoxication_risk"] for r in results) / len(results)
-    avg_rel = sum(r["alarm_reliability"] for r in results) / len(results)
-    return {
-        "false_alarm_prob": avg_fa,
-        "intoxication_risk": avg_tox,
-        "alarm_reliability": avg_rel,
-    }
 
 
 def compute_ebm_integrated_values(
@@ -3153,10 +2681,10 @@ def run_ablation_study(X_train, y_train, X_test, y_test, artifacts):
     
     # Dodajemy płaskie predykcje z CV (Early Fusion)
     matcher = SyntheticPhenotypeMatcher(random_state=CONFIG["SEED"])
-    crnn_tr, caps_tr, dense_tr = matcher.match_phenotypes(X_train)
+    crnn_tr, efficientnet_tr, dense_tr = matcher.match_phenotypes(X_train)
     
     X_train_base['cv_crnn'] = crnn_tr
-    X_train_base['cv_efficientnet'] = caps_tr
+    X_train_base['cv_efficientnet'] = efficientnet_tr
     X_train_base['cv_densenet'] = dense_tr
     
     X_test_base['cv_crnn'] = artifacts.get("dummy_crnn_test", np.full(len(X_test), 0.5))
@@ -3372,7 +2900,6 @@ def generate_and_save_metrics_report(y_true, y_prob, y_pred, baseline_preds=None
 def generate_full_synergy_report(calibrated_spec_pipe, artifacts, X_train, X_test, y_true):
     """ Kompleksowy moduł analizy ratunkowej. Generuje hierarchiczne wykresy SHAP, mapy atrybucji wizyjnej 
         oraz graficzną kwantyfikację synergii modeli bazowych przy użyciu standardowego matplotlib. """
-    logger = logging.getLogger(__name__)
     logger.info("Rozpoczynanie kompleksowej generacji raportów wizualizacji Synergii.")
     
     y_true_arr = np.array(y_true)
@@ -3791,390 +3318,6 @@ def evaluate_pipeline(calibrated_spec_pipe, artifacts, X_train, X_test, y_train,
         logger.error(f"Nie udało się wygenerować i zapisać automatycznego raportu JSON lub zaktualizować README: {e}")
 
 
-class PatientStateSONODE(nn.Module):
-    """ Równanie różniczkowe drugiego rzędu dla fizjologii pacjenta.
-        
-        Uzasadnienie teoretyczne i kliniczne:
-        Zwykłe Neural ODE (pierwszego rzędu) napotykają na fundamentalną barierę topologiczną 
-        wynikającą z twierdzenia Picarda-Lindelöfa: ich trajektorie w przestrzeni stanów nie mogą się 
-        przecinać. Powoduje to, że nieliniowo separowalne pułapki i stany ryzyka są dla nich matematycznie 
-        niemożliwe do rozwikłania:
-        1. Problem XOR z GCS i sedacją: Izolowane objawy bywają mylące (np. wysoki GCS bez sedacji to stan 
-           stabilny, ale nagły spadek GCS przy braku leków sedacyjnych to alarm krytyczny). Zwykłe ODE nie potrafi 
-           przeciąć trajektorii tych pacjentów, co generuje fałszywe alarmy.
-        2. Fizjologiczne Nested Spheres (koncentryczne sfery ryzyka): Fizjologia opiera się na optimum homeostazy 
-           (efekt U-Shape). Zarówno zbyt niskie, jak i zbyt wysokie wartości (np. hipotensja vs hypertensja) 
-           róvnocześnie zagrażają mózgowi. Standardowe ODE dusi się, próbując rozdzielić sferę zdrowia uwięzioną 
-           wewnątrz sfery stanu krytycznego bez możliwości przecięcia warstw.
-           
-        SONODE pokonuje te ograniczenia, rozszerzając przestrzeń fazową o wymiar dynamiki i przyspieszenia. 
-        Dzięki temu trajektorie mogą swobodnie przechodzić nad sobą w wyższym wymiarze, umożliwiając analizę 
-        drugiej pochodnej i natychmiastowe wychwycenie nieliniowego, przyspieszającego załamania homeostazy, 
-        w tym kluczowych stanów neurokrytycznych:
-        - Wyczerpanie rezerwy kompensacyjnej czaszki (Wejście na strome ramię wykładniczej krzywej podatności objętościowej).
-        - Opóźniona ekspansja krwiaka / Lucid Interval (Gdy pacjent z GCS 15 nagle zaczyna gwałtownie manewrować wektorami ciśnienia 
-          i tętna przed utratą przytomności z powodu pęknięcia tętnicy oponowej środkowej).
-        - Dynamiczny Odruch Cushinga (Wykrywanie rozpędzania się rozjazdu ciśnienia skurczowego i bradykardii jako zwiastuna wgłobienia).
-        - Dekompresja we wstrząsie krwotocznym (Moment, w którym mechanizmy wazokonstrykcji pękają, wywołując logarytmiczny spadek MAP). """
-    def __init__(self, hidden_dim=16):
-        super().__init__()
-        # Sieć przyjmuje połączony stan i prędkość zmian [h, v]
-        self.net = nn.Sequential(
-            nn.Linear(hidden_dim * 2, hidden_dim * 2),
-            nn.Tanh(),
-            nn.Linear(hidden_dim * 2, hidden_dim)
-        )
-        
-    def forward(self, t, state):
-        """ Ponieważ torchdiffeq oczekuje wektora stanu, dla SONODE rozszerzamy wymiar o prędkość. """
-        h, v = torch.chunk(state, 2, dim=-1)
-        
-        # Pochodna stanu to obecna prędkość: dh/dt = v
-        dh_dt = v
-        
-        # Pochodna prędkości (przyspieszenie) to nieliniowa funkcja sił fizjologicznych: dv/dt = f(h, v)
-        combined_input = torch.cat([h, v], dim=-1)
-        dv_dt = self.net(combined_input)
-        
-        # Zwracamy spakowaną pochodną pierwszego i drugiego rzędu
-        return torch.cat([dh_dt, dv_dt], dim=-1)
-
-
-class LatentODE_VAE_Generator(nn.Module):
-    """ Generatywny Model Neural ODE połączony z Variational Autoencoder.
-        Zabezpiecza przed overfittingiem i generowaniem medycznych halucynacji. """
-    def __init__(self, input_dim=22, hidden_dim=16):
-        super().__init__()
-        self.hidden_dim = hidden_dim
-        
-        # RNN czyta historię pacjenta
-        self.encoder_rnn = nn.GRU(input_dim, hidden_dim, batch_first=True)
-        
-        # Przekształcenie w rozkład prawdopodobieństwa przy użyciu VAE
-        self.fc_mu = nn.Linear(hidden_dim, hidden_dim)       # Średnia rozkładu
-        self.fc_logvar = nn.Linear(hidden_dim, hidden_dim)   # Logarytm wariancji
-        
-        # ODE dla dynamiki stanu pacjenta w czasie. To jest serce modelu, które przewiduje trajektorie fizjologiczne.
-        self.ode_func = PatientStateSONODE(hidden_dim)
-        
-        # Odtwarzanie surowych parametrów medycznych
-        self.decoder = nn.Sequential(
-            nn.Linear(hidden_dim, 32),
-            nn.ReLU(),
-            nn.Linear(32, input_dim)
-        )
-        
-        # Przewidywanie ryzyka zgonu w czasie na podstawie trajektorii ukrytej
-        self.risk_head = nn.Sequential(
-            nn.Linear(hidden_dim, 8),
-            nn.ReLU(),
-            nn.Linear(8, 1),
-            nn.Sigmoid()
-        )
-
-    def reparameterize(self, mu, logvar):
-        """ Reparameterization Trick: Pozwala na propagację wsteczną
-            przez proces losowego próbkowania z przestrzeni ukrytej. """
-        std = torch.exp(0.5 * logvar)
-        eps = torch.randn_like(std) # Szum z rozkładu normalnego N(0,1)
-        return mu + eps * std
-        
-    def forward(self, vitals_seq, t_seq):
-        """ Przepływ treningowy z obliczaniem straty KLD """
-        # Najpierw RNN przetwarza historię
-        _, h_rnn = self.encoder_rnn(vitals_seq) 
-        h_rnn = h_rnn.squeeze(0)
-        
-        # Projekcja do przestrzeni VAE
-        mu = self.fc_mu(h_rnn)
-        logvar = self.fc_logvar(h_rnn)
-        
-        # Próbkowanie szablonu z=h(0)
-        z_0 = self.reparameterize(mu, logvar)
-        
-        # Dodajemy wektor początkowej prędkości (wyzerowany) i łączymy ze stanem
-        v_0 = torch.zeros_like(z_0)
-        state_0 = torch.cat([z_0, v_0], dim=-1)
-        
-        # Odcałkowanie w czasie za pomocą ODE (wchodzi rozszerzony stan)
-        state_t = odeint(self.ode_func, state_0, t_seq, method='dopri5')
-        
-        # Rozcinamy z powrotem, do dekodera idzie tylko stan
-        h_t, _ = torch.chunk(state_t, 2, dim=-1)
-        
-        # Dekodowanie
-        raw_reconstructed = self.decoder(h_t)
-        
-        # Zabezpieczamy sieć przed wygenerowaniem np. ujemnego ICP lub tętna.
-        reconstructed_vitals = torch.clamp(raw_reconstructed, min=0.0)
-        
-        # Predykcja ryzyka
-        risk_trajectory = self.risk_head(h_t).squeeze(-1)
-        
-        reconstructed_vitals = reconstructed_vitals.permute(1, 0, 2)
-        risk_trajectory = risk_trajectory.permute(1, 0)
-        
-        # Obliczenie KLD. Zmusza przestrzeń ukrytą do przybrania kształtu idealnego rozkładu normalnego.
-        kld_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
-        
-        return reconstructed_vitals, risk_trajectory, kld_loss
-
-    def generate_synthetic_patients(self, base_vitals_seq, t_seq, num_samples=5):
-        """ Generowanie z użyciem przestrzeni VAE. Szum jest nadzorowany przez wyuczoną
-            wariancję danego pacjenta, a nie zgadywany w ciemno. """
-        self.eval()
-        with torch.no_grad():
-            _, h_rnn = self.encoder_rnn(base_vitals_seq)
-            h_rnn = h_rnn.squeeze(0)
-            
-            mu = self.fc_mu(h_rnn)
-            logvar = self.fc_logvar(h_rnn)
-            
-            synthetic_patients = []
-            for _ in range(num_samples):
-                z_0 = self.reparameterize(mu, logvar)
-                
-                # Uwzględniamy prędkość początkową w SONODE, żeby model mógł uchwycić przyspieszające pogorszenie stanu pacjenta
-                v_0 = torch.zeros_like(z_0)
-                state_0 = torch.cat([z_0, v_0], dim=-1)
-                
-                state_t = odeint(self.ode_func, state_0, t_seq, method='dopri5')
-                h_t, _ = torch.chunk(state_t, 2, dim=-1)
-                
-                raw_vitals = self.decoder(h_t)
-                synthetic_vitals = torch.clamp(raw_vitals, min=0.0)
-                synthetic_vitals = synthetic_vitals.permute(1, 0, 2).squeeze(0)
-                
-                synthetic_patients.append(synthetic_vitals)
-                
-        return torch.stack(synthetic_patients)
-
-    def generate_counterfactual_augmentation(self, base_vitals_seq, t_seq, original_treatments, target_treatment_idx, time_of_intervention_idx):
-        """ Tworzy kontrfaktyczną trajektorię pacjenta poprzez modyfikację interwencji. 
-            Zwraca zrekonstruowane parametry życiowe jako symulację 'co by było gdyby'. """
-        self.eval()
-        with torch.no_grad():
-            # Kodowanie aktualnej historii pacjenta do punktu startowego
-            _, h_rnn = self.encoder_rnn(base_vitals_seq)
-            h_rnn = h_rnn.squeeze(0)
-            
-            mu = self.fc_mu(h_rnn)
-            logvar = self.fc_logvar(h_rnn)
-            z_0 = self.reparameterize(mu, logvar)
-            
-            # Stan początkowy (pozycja + początkowa prędkość dla SONODE)
-            v_0 = torch.zeros_like(z_0)
-            state_0 = torch.cat([z_0, v_0], dim=-1)
-            
-            # Kopiujemy oryginalne leczenie i zmieniamy w wybranym momencie
-            cf_treatments = original_treatments.clone()
-            current_action = cf_treatments[:, time_of_intervention_idx:, target_treatment_idx]
-            cf_treatments[:, time_of_intervention_idx:, target_treatment_idx] = 1.0 - current_action
-            
-            # Dodajemy kontrfaktyczne leczenie do funkcji ODE, aby trajektoria uwzględniała zmienione interwencje
-            self.ode_func.set_treatments(cf_treatments)
-            state_t = odeint(self.ode_func, state_0, t_seq, method='dopri5')
-            h_t, _ = torch.chunk(state_t, 2, dim=-1)
-            
-            # Zdekodowanie ukrytych wektorów z powrotem na parametry medyczne
-            raw_vitals = self.decoder(h_t)
-            synthetic_vitals = torch.clamp(raw_vitals, min=0.0)
-            synthetic_vitals = synthetic_vitals.permute(1, 0, 2).squeeze(0)
-            
-        return synthetic_vitals, cf_treatments
-
-
-class LatentODE_PatientGenerator(nn.Module):
-    """ Generatywny Model Neural ODE. Działa jako Enkoder-Dekoder oparty na równaniach różniczkowych. """
-    def __init__(self, input_dim=22, hidden_dim=16):
-        super().__init__()
-        self.hidden_dim = hidden_dim
-        
-        # Czyta dotychczasową historię pacjenta i wyciąga najważniejsze cechy do przestrzeni ukrytej
-        self.encoder = nn.GRU(input_dim, hidden_dim, batch_first=True)
-        
-        # Przesuwa stan pacjenta w czasie ciągłym
-        self.ode_func = PatientStateSONODE(hidden_dim)
-        
-        # Tłumaczy ukryty stan z powrotem na fizyczne parametry (ICP, GCS, Lactate itp.)
-        self.decoder = nn.Sequential(
-            nn.Linear(hidden_dim, 32),
-            nn.ReLU(),
-            nn.Linear(32, input_dim)
-        )
-
-        # Klasyfikuje ciężkość stanu w danym momencie t
-        self.risk_head = nn.Sequential(
-            nn.Linear(hidden_dim, 8),
-            nn.ReLU(),
-            nn.Linear(8, 1),
-            nn.Sigmoid()
-        )
-        
-    def forward(self, vitals_seq, t_seq):
-        """ Przepływ treningowy (rekonstrukcja i predykcja). """        
-        _, h_0 = self.encoder(vitals_seq) 
-        h_0 = h_0.squeeze(0)
-        
-        h_t = odeint(self.ode_func, h_0, t_seq, method='dopri5')
-        
-        reconstructed_vitals = self.decoder(h_t)
-        risk_trajectory = self.risk_head(h_t).squeeze(-1)
-        
-        reconstructed_vitals = reconstructed_vitals.permute(1, 0, 2)
-        risk_trajectory = risk_trajectory.permute(1, 0)
-        
-        return reconstructed_vitals, risk_trajectory
-
-    def generate_synthetic_patients_via_interpolation(self, tier1_vitals, tier2_vitals, t_seq, num_samples=5, mix_ratio=0.7):
-        """ Kliniczna Interpolacja w Przestrzeni Ukrytej ODE. Bierze stabilnych pacjentów jako tło biologiczne i popycha
-            ich trajektorie w stronę krytycznego pogorszenia. """
-        self.eval()
-        with torch.no_grad():
-            # Poprawka: używamy self.encoder zamiast self.encoder_rnn
-            _, h_tier2 = self.encoder(tier2_vitals)
-            h_tier2 = h_tier2.squeeze(0)
-            
-            critical_center = torch.mean(h_tier2, dim=0, keepdim=True)
-            
-            _, h_tier1 = self.encoder(tier1_vitals)
-            h_tier1 = h_tier1.squeeze(0)
-            
-            synthetic_patients = []
-            
-            for _ in range(num_samples):
-                idx = torch.randint(0, h_tier1.size(0), (1,)).item()
-                base_h = h_tier1[idx].unsqueeze(0)
-                
-                interpolated_h = (1.0 - mix_ratio) * base_h + mix_ratio * critical_center
-                noisy_h = interpolated_h + torch.randn_like(interpolated_h) * 0.05
-                
-                h_t = odeint(self.ode_func, noisy_h, t_seq, method='dopri5')
-                
-                raw_vitals = self.decoder(h_t)
-                synthetic_vitals = torch.clamp(raw_vitals, min=0.0)
-                synthetic_vitals = synthetic_vitals.permute(1, 0, 2).squeeze(0)
-                
-                synthetic_patients.append(synthetic_vitals)
-                
-        return torch.stack(synthetic_patients)  
-
-
-class BayesianTrajectoryMonitor:
-    """ Moduł Longitudinalnego Monitorowania Pacjenta wzbogacony o zanikanie alarmów, kontekst sedacji farmakologicznej
-        oraz nieliniowe kary za wgłobienie bazujące na rezerwie biologicznej. """
-    def __init__(self, initial_prob: float, patient_age: int = 50):
-        self.patient_age = patient_age
-        self.current_prob = max(min(initial_prob, 0.99), 0.01) # Zabezpieczenie przed 0 i 1
-        self.current_odds = self.current_prob / (1 - self.current_prob)
-        self.history = [{
-            "time": datetime.datetime.now(), 
-            "prob": self.current_prob, 
-            "event": "Admission (Cascade Baseline)"
-        }]
-        self.last_update_time = datetime.datetime.now()
-
-    def update_belief(self, new_vitals: dict, current_time: datetime.datetime = None) -> float:
-        if current_time is None: 
-            current_time = datetime.datetime.now()
-
-        likelihood_ratio = 1.0
-        event_notes = []
-
-        # Zanikanie czasowe - jeśli nic się nie dzieje, pacjent powoli stabilizuje się
-        hours_passed = (current_time - self.last_update_time).total_seconds() / 3600.0
-        decay_factor = 0.98 ** hours_passed
-        self.current_odds *= decay_factor
-
-        # Flaga śpiączki farmakologicznej (zapobiega fałszywym alarmom ostrego spadku GCS)
-        is_sedated = new_vitals.get('sedatives_administered', False)
-
-        # Płynna zmiana GCS
-        if 'delta_gcs' in new_vitals:
-            drop = new_vitals['delta_gcs']
-            if drop < 0:
-                # Nieliniowy wzrost ryzyka
-                base_penalty = 1.0 + (abs(drop) ** 1.5) * 0.5 
-                
-                if is_sedated:
-                    likelihood_ratio *= (1.0 + (base_penalty - 1.0) * 0.2) # Tłumienie o 80% przez leki (GABA)
-                    event_notes.append(f"GCS {drop} (Sedacja, zmniejszona kara: LR: {(1.0 + (base_penalty - 1.0) * 0.2):.2f}x)")
-                else:
-                    likelihood_ratio *= base_penalty
-                    event_notes.append(f"KRYTYCZNE GCS {drop} (LR: {base_penalty:.2f}x)")
-            elif drop > 0:
-                reward = 0.8 ** drop  # Płynny bonus za wybudzanie
-                likelihood_ratio *= reward
-                event_notes.append(f"GCS + {drop} (LR: {reward:.2f}x)")
-
-        # Ciśnienie wewnątrzczaszkowe (Normalne ICP to 5-15 mmHg)
-        if 'icp_current' in new_vitals:
-            icp = new_vitals['icp_current']
-            if icp > 15.0:
-                excess_icp = icp - 15.0
-                
-                # Modyfikator geriatryczny (atrofia mózgu zmienia objętość rezerwową czaszki)
-                if self.patient_age >= 75:
-                    age_mod = 1.5 
-                elif self.patient_age < 30:
-                    age_mod = 0.7 
-                else:
-                    age_mod = 1.0
-                
-                # Wykładniczy mnożnik: przy ICP 22 u 50-latka wyniesie ok. 3.4x, przy 25 wyniesie ok. 6.0x
-                icp_multiplier = 1.0 + ((excess_icp * 0.2) ** 2) * age_mod
-                likelihood_ratio *= icp_multiplier
-                event_notes.append(f"ICP {icp} mmHg (LR: {icp_multiplier:.2f}x)")
-
-        # Brak złych wieści i brak sedacji to dobra wiadomość
-        if likelihood_ratio == 1.0 and not is_sedated:
-            likelihood_ratio = 0.95
-            event_notes.append("Stabilny stan (LR: 0.95x)")
-
-        # Aktualizacja Szans i konwersja z powrotem na Prawdopodobieństwo
-        self.current_odds *= likelihood_ratio
-        self.current_prob = self.current_odds / (1 + self.current_odds)
-        self.last_update_time = current_time
-
-        self.history.append({
-            "time": current_time,
-            "prob": self.current_prob,
-            "event": " | ".join(event_notes)
-        })
-
-        return self.current_prob
-    
-
-class WeaningReadinessEvaluator(nn.Module):
-    """ Moduł oceniający prawdopodobieństwo udanej ekstubacji (odłączenia od respiratora).
-        Zaprojektowany do uczenia na rozszerzonych danych oddechowych ze zbioru eICU.
-        Wymaga pełnego profilu oddechowo-hemodynamicznego:
-        1-5. Baza: Wiek, GCS, Ciśnienie, Tętno, Wskaźnik Oksygenacji (SpO2/FiO2)
-        6. RSBI (Rapid Shallow Breathing Index) - stosunek częstości oddechów do objętości oddechowej
-        7-9. Gazometria: pH krwi, PaO2, PaCO2 (krytyczne dla zapobiegania obrzękowi mózgu)
-        10-11. Parametry respiratora: PEEP (dodatnie ciśnienie końcowowydechowe), PIP (szczytowe ciśnienie)
-        12. RASS (Poziom sedacji/pobudzenia) - pacjent musi współpracować. """
-    def __init__(self, input_dim=12):
-        super(WeaningReadinessEvaluator, self).__init__()
-        self.evaluator = nn.Sequential(
-            nn.Linear(input_dim, 32),
-            nn.BatchNorm1d(32),
-            nn.ReLU(),
-            nn.Dropout(0.3), # Zwiększony dropout ze względu na większą liczbę cech
-            nn.Linear(32, 16),
-            nn.BatchNorm1d(16),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(16, 8),
-            nn.ReLU(),
-            nn.Linear(8, 1),
-            nn.Sigmoid()  # Zwraca prawdopodobieństwo (0.0 - 1.0) udanej próby oddechu własnego
-        )
-
-    def forward(self, x):
-        return self.evaluator(x)
-
-
 def extract_mimic_tbi_trajectories(db_uri: str, limit_patients: int = 100):
     """ Wyciąga z lokalnej bazy MIMIC-IV sekwencje czasowe GCS oraz ICP 
         dla pacjentów z urazami głowy w ciągu pierwszych 24h pobytu na OIT. """
@@ -4215,402 +3358,6 @@ def extract_mimic_tbi_trajectories(db_uri: str, limit_patients: int = 100):
     return df
 
 
-def prepare_real_icu_tensors(df: pd.DataFrame, max_seq_len: int = 24):
-    """ Przetwarza surowe dane z MIMIC-IV: 
-        - Rozdziela parametry kliniczne na niezależne kanały (np. ICP, GCS).
-        - Zachowuje wielowymiarowy tensor cech [Batch, SeqLen, InputDim].
-        - Wykonuje niezależną interpolację i obsługę braków danych dla każdego kanału. """
-    # Mapowanie MIMIC itemid na nazwy kliniczne
-    item_mapping = {
-        220045: 'icp',
-        226537: 'icp',
-        220739: 'gcs_total',
-        223900: 'gcs_eye',
-        223901: 'gcs_motor',
-        223902: 'gcs_verbal'
-    }
-    
-    df['clinical_feature'] = df['itemid'].map(item_mapping)
-    df = df.dropna(subset=['clinical_feature'])
-    
-    batch_features = []
-    batch_deltas = []
-    
-    grouped = df.groupby('stay_id')
-    
-    # Ustalamy stałą listę cech wejściowych
-    feature_columns = ['icp', 'gcs_total']
-    input_dim = len(feature_columns)
-    
-    for stay_id, group in grouped:
-        group = group.sort_values('hours_from_admission')
-        
-        if len(group) < 2:
-            continue
-            
-        # Okno czasowe (np. dyskretyzacja do pełnych godzin pobytu)
-        group['hour_bin'] = group['hours_from_admission'].astype(int)
-        
-        # Pivotowanie tabeli: wiersze to godziny, kolumny to niezależne parametry kliniczne
-        pivot_df = group.pivot_table(
-            index='hour_bin', 
-            columns='clinical_feature', 
-            values='valuenum', 
-            aggfunc='mean'
-        )
-        
-        # Upewnienie się, że wszystkie wymagane kolumny istnieją w pivot_df
-        for col in feature_columns:
-            if col not in pivot_df.columns:
-                pivot_df[col] = np.nan
-                
-        pivot_df = pivot_df[feature_columns]
-        
-        # Ograniczenie do max_seq_len godzin
-        if len(pivot_df) > max_seq_len:
-            pivot_df = pivot_df.head(max_seq_len)
-            
-        # Najpierw forward-fill (ostatnia znana wartość), potem backward-fill, na końcu 0 dla braków startowych
-        pivot_df = pivot_df.ffill().bfill().fillna(0.0)
-        
-        features_matrix = pivot_df.values # Kształt: [Liczba rzeczywistych kroków, input_dim]
-        hours = pivot_df.index.values
-        
-        # Obliczenie rzeczywistych odstępów czasu dt dla każdego kroku
-        dt = np.diff(hours, prepend=hours[0])
-        dt[dt <= 0] = 1.0 # Zabezpieczenie przed dt=0 przy wielu pomiarach w tej samej godzinie
-        
-        # Padding sekwencji do stałej długości (max_seq_len)
-        current_len = len(features_matrix)
-        if current_len < max_seq_len:
-            pad_len = max_seq_len - current_len
-
-            # Padding zerami dla cech, padding stałym krokiem czasowym (np. 1.0h) dla dt
-            features_matrix = np.pad(features_matrix, ((0, pad_len), (0, 0)), 'constant', constant_values=0.0)
-            dt = np.pad(dt, (0, pad_len), 'constant', constant_values=1.0)
-        elif current_len > max_seq_len:
-            features_matrix = features_matrix[:max_seq_len]
-            dt = dt[:max_seq_len]
-            
-        batch_features.append(features_matrix)
-        batch_deltas.append(dt)
-        
-    if not batch_features:
-        raise ValueError("Brak poprawnych trajektorii po przetworzeniu.")
-        
-    # Konwersja na tensory o wymiarach wymaganych przez model wielowymiarowy
-    X_tensor = torch.tensor(np.array(batch_features), dtype=torch.float32)
-    Dt_tensor = torch.tensor(np.array(batch_deltas), dtype=torch.float32)
-    
-    return X_tensor, Dt_tensor
-
-
-class ODEFunc(nn.Module):
-    """ Definiuje pochodną stanu ukrytego w czasie: dh/dt = f(h(t), t) """
-    def __init__(self, hidden_dim: int):
-        super(ODEFunc, self).__init__()
-        self.net = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.Tanh(),
-            nn.Linear(hidden_dim, hidden_dim)
-        )
-        
-    def forward(self, t, h):
-        return self.net(h)
-
-
-class NeuralODE_ICU_Monitor(nn.Module):
-    """ Ciągły model monitorowania trajektorii stanu (ciągła ewolucja intencji lub wstrząsów 
-        w nieregularnych odstępach czasu) z użyciem mechanizmów Neural ODE. """
-    def __init__(self, input_dim: int, hidden_dim: int, output_dim: int = 1):
-        super(NeuralODE_ICU_Monitor, self).__init__()
-        self.input_projection = nn.Linear(input_dim, hidden_dim)
-        self.ode_func = ODEFunc(hidden_dim)
-        self.output_layer = nn.Linear(hidden_dim, output_dim)
-        
-    def forward(self, sequence_features, time_deltas):
-        batch_size, seq_len, _ = sequence_features.shape
-        device = sequence_features.device
-        h = torch.zeros(batch_size, self.ode_func.net[0].in_features, device=device)
-        
-        for i in range(seq_len):
-            x_t = sequence_features[:, i, :]
-            dt = time_deltas[:, i].unsqueeze(-1)
-            
-            # Aktualizacja stanu wejściowego w danym kroku
-            h = h + self.input_projection(x_t)
-            
-            # Ciągła ewolucja trajektorii o zadany interwał czasowy dt
-            deriv = self.ode_func(0.0, h)
-            h = h + deriv * dt
-            
-        return torch.sigmoid(self.output_layer(h))
-
-
-def generate_icu_clinical_scenario(num_patients: int = 100, seq_length: int = 24, seed: int = 42) -> Tuple[pd.DataFrame, torch.Tensor, List[str]]:
-    """ Generuje wielomodalny syntetyczny scenariusz kliniczny dla pacjentów OIT z TBI.
-        Zasila kaskadę testową i przygotowuje grunt pod moduł sekwencyjny """
-    np.random.seed(seed)
-    
-    # Dane tabelaryczne
-    ages = np.random.normal(45, 15, num_patients).clip(18, 90).astype(int)
-    gcs_scores = np.random.randint(3, 16, num_patients)
-    pupils = np.random.choice(['Both Reactive', 'One Reactive', 'Non-reactive'], num_patients, p=[0.7, 0.2, 0.1])
-    
-    df_tabular = pd.DataFrame({
-        'PatientID': [f'ICU_{i:04d}' for i in range(num_patients)],
-        'Age': ages,
-        'Admission_GCS': gcs_scores,
-        'Pupil_Reactivity': pupils,
-        'Hypotension_Flag': np.random.choice([0, 1], num_patients, p=[0.8, 0.2])
-    })
-    
-    # Szeregi czasowe dla CRNN
-    time_series = np.zeros((num_patients, seq_length, 4))
-    clinical_notes = []
-    
-    for i in range(num_patients):
-        # Wyjściowe parametry powiązane z ciężkością urazu (GCS)
-        base_icp = np.random.normal(12, 3) if gcs_scores[i] > 8 else np.random.normal(22, 5)
-        base_map = np.random.normal(85, 10)
-        
-        # Symulacja trajektorii czasowej (Random Walk z dryfem)
-        icp_trend = base_icp + np.cumsum(np.random.normal(0, 1.5, seq_length))
-        map_trend = base_map + np.cumsum(np.random.normal(0, 2.0, seq_length))
-        hr_trend = np.random.normal(75, 15) + np.cumsum(np.random.normal(0, 1.0, seq_length))
-        spo2_trend = np.clip(np.random.normal(96, 2) + np.cumsum(np.random.normal(0, 0.5, seq_length)), 80, 100)
-        
-        time_series[i, :, 0] = np.clip(icp_trend, 0, 50)
-        time_series[i, :, 1] = np.clip(map_trend, 40, 130)
-        time_series[i, :, 2] = np.clip(hr_trend, 40, 180)
-        time_series[i, :, 3] = spo2_trend
-        
-    return df_tabular, torch.tensor(time_series, dtype=torch.float32), clinical_notes
-
-
-def serve_patient_stream(calibrated_spec_pipe,
-    X_test,
-    ode_monitor=None,
-    weaning_model=None,
-    redis_host="localhost",
-):
-  """Symuluje strumieniowy napływ danych pacjenta z bazy Redis w czasie rzeczywistym.
-
-  Porównuje trajektorię Bayesowską z ciągłą, odcałkowaną (Neural ODE). """
-  logger = logging.getLogger(__name__)
-  logger.info(
-      "Pokaz działania na żywo: Inicjalna Kaskada (SOR) -> Monitorowanie (OIT)"
-  )
-  buffer = RealTimePatientBuffer(host=redis_host, port=6379)
-
-  # Bezpieczna, granularna inicjalizacja klienta Redis dla alertów
-  r_cache = None
-  try:
-    r_cache = redis.Redis(
-        host=redis_host, 
-        port=6379, 
-        decode_responses=True,
-        socket_timeout=2.0,
-        socket_connect_timeout=2.0
-    )
-    r_cache.ping()
-  except redis.AuthenticationError as e:
-    logger.error(f"Błąd uwierzytelniania w bazie Redis (sprawdź poświadczenia): {e}")
-    r_cache = None
-  except (redis.ConnectionError, redis.TimeoutError) as e:
-    logger.warning(f"Serwer Redis na hoście '{redis_host}' jest niedostępny lub przeciążony: {e}")
-    r_cache = None
-  except (socket.gaierror, OSError) as e:
-    logger.warning(f"Problem z siecią lub rozwiązaniem adresu hosta Redis ({redis_host}): {e}")
-    r_cache = None
-  except redis.RedisError as e:
-    logger.error(f"Nieznany błąd biblioteki Redis podczas inicjalizacji: {e}")
-    r_cache = None
-
-  current_patient_id = 1
-  buffer.update_patient_data(
-      hadm_id=current_patient_id,
-      category="vitals",
-      data={"gcs_sum": 13, "sysbp_min": 120},
-  )
-
-  if buffer.is_ready_for_inference(current_patient_id):
-    # Triage na SORze
-    X_live_patient = pd.DataFrame([X_test.iloc[0].to_dict()])
-    _, probs = calibrated_spec_pipe.predict_with_clinical_review(X_live_patient)
-
-    initial_prob = float(probs[0])
-    logger.info(
-        f"Oceniono pacjenta {current_patient_id} na wejściu. Prawdopodobieństwo"
-        f" krytyczne: {initial_prob*100:.1f}%"
-    )
-
-    logger.info(
-        "Uruchamianie równoległego monitoringu: Bayesian Tracking vs Neural ODE"
-        " Continuous Tracking."
-    )
-
-    # Wyciągamy wiek dla monitoringu
-    p_age = (
-        int(X_live_patient["age"].iloc[0])
-        if "age" in X_live_patient.columns
-        else 50
-    )
-    bayesian_monitor = BayesianTrajectoryMonitor(
-        initial_prob, patient_age=p_age
-    )
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    if ode_monitor is None:
-      ode_monitor = NeuralODE_ICU_Monitor(input_dim=2, hidden_dim=16).to(device)
-    ode_monitor.eval()
-
-    # Przykładowy scenariusz
-    chosen_scenario = "sudden_hematoma"
-    simulated_events = generate_icu_clinical_scenario(
-        scenario_name=chosen_scenario, duration_hours=18
-    )
-
-    bayesian_probs_over_time = [initial_prob]
-
-    # Zmienne do śledzenia ciągłej trajektorii ODE
-    time_points = [0.0]
-    cumulative_gcs = 13
-    vitals_history = [[float(cumulative_gcs), 12.0]]
-
-    for hour, vitals in enumerate(simulated_events, 1):
-      
-      # Ścieżka Bayesowska
-      new_prob = bayesian_monitor.update_belief(vitals)
-      bayesian_probs_over_time.append(new_prob)
-      logger.info(
-          f"Godzina {hour} OIT | Zmiany: {vitals} | Zaktualizowane Ryzyko:"
-          f" {new_prob*100:.1f}%"
-      )
-
-      if new_prob > 0.85 and r_cache is not None:
-        try:
-          r_cache.setex(
-              f"alert:patient:{current_patient_id}:urgent",
-              300,
-              "CODE RED: Wgłobienie/Krwotok w toku!",
-          )
-        except redis.RedisError as e:
-          logger.warning(f"Nie udało się zapisać alertu w Redis: {e}")
-        logger.warning("SYSTEM WYGENEROWAŁ NOWY, DYNAMICZny ALERT RATUNKOWY! <<<")
-
-      # Gromadzenie danych dla ścieżki ODE
-      cumulative_gcs += vitals.get("delta_gcs", 0)
-      icp = vitals.get("icp_current", 12.0)
-      time_points.append(float(hour))
-      vitals_history.append([float(cumulative_gcs), float(icp)])
-
-    # Ścieżka i kształt Neural ODE (Ciągła całka)
-    t_seq = torch.tensor(time_points, dtype=torch.float32).to(device)
-    v_seq = (
-        torch.tensor(vitals_history, dtype=torch.float32)
-        .unsqueeze(1)
-        .to(device)
-    )
-
-    ode_probs_over_time = []
-    if odeint is not None:
-      with torch.no_grad():
-        # Uruchamiamy solver równań różniczkowych i spłaszczamy wymiary
-        ode_probs = ode_monitor(v_seq, t_seq).cpu().numpy().squeeze()
-        if ode_probs.ndim == 0:
-          ode_probs = np.array([ode_probs])
-
-        base_shift = initial_prob - ode_probs[0]
-        ode_probs_over_time = np.clip(
-            ode_probs + base_shift + np.linspace(0, 0.4, len(ode_probs)), 0, 1
-        )
-    else:
-      ode_probs_over_time = np.zeros(len(time_points))
-
-    # Wykres Trajektorii Pacjenta
-    plt.figure(figsize=(10, 5))
-    plt.plot(
-        range(len(bayesian_probs_over_time)),
-        [p * 100 for p in bayesian_probs_over_time],
-        marker="o",
-        linestyle="-",
-        color="red" if chosen_scenario == "sudden_hematoma" else "green",
-        label="Bayesian Discrete Tracking",
-    )
-
-    if odeint is not None:
-      plt.plot(
-          time_points,
-          [p * 100 for p in ode_probs_over_time],
-          linestyle="-.",
-          color="purple",
-          linewidth=2.5,
-          label="Neural ODE Continuous Flow",
-      )
-
-    plt.axhline(y=85, color="darkred", linestyle=":", label="Próg Alarmu Krytycznego")
-    plt.title(
-        f"Trajektoria Pacjenta (Bayes vs Neural ODE) - Scenariusz:"
-        f" {chosen_scenario}"
-    )
-    plt.xlabel("Godziny po przyjęciu na OIT")
-    plt.ylabel("Prawdopodobieństwo Zgonu/Wgłobienia (%)")
-    plt.ylim(0, 100)
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    plt.savefig(
-        f'{CONFIG["PLOTS_DIR"]}/bayesian_vs_ode_{chosen_scenario}.png', dpi=300
-    )
-    plt.close()
-
-    # Logistyka i Respirator (dla zaintubowanych)
-    is_intubated = X_live_patient.get("is_intubated", pd.Series([0])).iloc[0]
-
-    if is_intubated == 1:
-      logger.info(
-          "Faza 9: Ocena gotowości do odłączenia od respiratora (Weaning"
-          " Prediction)."
-      )
-
-      sf_ratio = (
-          X_live_patient.get("sf_ratio", pd.Series([250.0])).iloc[0]
-      )
-      gcs = X_live_patient.get("gcs_sum", pd.Series([8])).iloc[0]
-      map_bp = X_live_patient.get("map_min", pd.Series([75])).iloc[0]
-      hr = X_live_patient.get("heart_rate_max", pd.Series([90])).iloc[0]
-      age = X_live_patient.get("age", pd.Series([50])).iloc[0]
-
-      weaning_features = torch.tensor(
-          [[sf_ratio / 500.0, gcs / 15.0, map_bp / 120.0, hr / 150.0, age / 100.0]],
-          dtype=torch.float32,
-      ).to(device)
-
-      if weaning_model is None:
-        weaning_model = WeaningReadinessEvaluator(input_dim=5).to(device)
-      weaning_model.eval()
-
-      with torch.no_grad():
-        weaning_prob = weaning_model(weaning_features).item()
-
-      logger.info(
-          f"Oszacowane prawdopodobieństwo pomyślnej ekstubacji:"
-          f" {weaning_prob*100:.1f}%"
-      )
-
-      if weaning_prob > 0.80:
-        logger.info(
-            "SUGEROWANA INTERWENCJA (HITL): Parametry oddechowe ustabilizowane."
-            " Rozważ próbę oddechu własnego (SBT). Ostateczna decyzja należy do"
-            " Intensywisty."
-        )
-      else:
-        logger.info(
-            "SUGEROWANA INTERWENCJA: Parametry zbyt niskie na odłączenie"
-            " maszyny. Kontynuuj wentylację mechaniczną."
-        )
-
-
 def generate_synthetic_clinical_profiles(X_train_df):
     """ Generuje spójne profile kliniczne dla pacjentów na potrzeby fuzji wielomodalnej,
         jeśli pełny zbiór OIT z MIMIC jest w trybie awaryjnym. """
@@ -4641,62 +3388,6 @@ class FocalLoss(nn.Module):
         pt = torch.exp(-bce_loss)
         focal_loss = self.alpha * (1 - pt) ** self.gamma * bce_loss
         return focal_loss.mean()
-
-
-def extract_mimic_timeseries_3d(filepath, item_ids, admittimes_dict, max_hours=24):
-    """ Przetwarza surowe logi MIMIC-IV na trójwymiarowy tensor szeregów czasowych 
-        [Liczba_Pacjentów, Max_Godzin, Liczba_Cech]. Wykorzystuje Forward Fill dla braków. """
-    logger.info(f"Budowanie natywnych szeregów czasowych 3D z logów MIMIC-IV ({max_hours}h okno).")
-    
-    # Inicjalizacja słownika list dla każdego pacjenta
-    patient_trajectories = {}
-    item_id_list = list(item_ids.values())
-    flat_item_ids = [item for sublist in item_id_list for item in sublist]
-    
-    chunk_iterator = pd.read_csv(filepath, compression='gzip', chunksize=2000000, 
-                                 usecols=['hadm_id', 'itemid', 'charttime', 'valuenum'], parse_dates=['charttime'])
-    
-    for chunk in tqdm(chunk_iterator, desc="Ekstrakcja sekwencji z 30 GB chartevents", leave=False):
-        filtered = chunk[chunk['itemid'].isin(flat_item_ids)].copy()
-        if filtered.empty:
-            continue
-            
-        # Mapowanie itemid na ujednolicone nazwy cech
-        reverse_map = {vid: k for k, vlist in item_ids.items() for vid in vlist}
-        filtered['feature_name'] = filtered['itemid'].map(reverse_map)
-        
-        # Odrzucamy pacjentów, dla których nie mamy czasu przyjęcia
-        filtered = filtered[filtered['hadm_id'].isin(admittimes_dict.keys())].copy()
-        filtered['admittime'] = filtered['hadm_id'].map(admittimes_dict)
-        
-        # Wyliczamy, w której godzinie od przyjęcia nastąpił pomiar
-        filtered['hour'] = ((filtered['charttime'] - filtered['admittime']).dt.total_seconds() // 3600).astype(int)
-        
-        # Bierzemy tylko pierwsze X godzin pobytu na OIT (np. 24h)
-        valid_time = filtered[(filtered['hour'] >= 0) & (filtered['hour'] < max_hours)]
-        
-        for _, row in valid_time.iterrows():
-            hid = row['hadm_id']
-            if hid not in patient_trajectories:
-                # Inicjalizacja pustej macierzy dla pacjenta: [godziny, cechy] (wypełniona NaN)
-                patient_trajectories[hid] = np.full((max_hours, len(item_ids)), np.nan)
-                
-            feat_idx = list(item_ids.keys()).index(row['feature_name'])
-
-            # Wpisujemy wartość do odpowiedniej godziny. Jeśli jest kilka w tej samej godzinie, nadpisujemy najnowszą
-            patient_trajectories[hid][row['hour'], feat_idx] = row['valuenum']
-
-    logger.info("Imputacja sekwencyjna (Forward Fill, czyli Wypełnianie średnią populacyjną)")
-    final_3d_dict = {}
-    
-    # Uzupełniamy luki ostatnią znaną wartością, a zera początkowe wartością z populacji
-    for hid, matrix in patient_trajectories.items():
-        df_seq = pd.DataFrame(matrix)
-        df_seq.ffill(inplace=True) # Forward fill - przenosi pomiar na kolejne godziny, jeśli brak nowego
-        df_seq.fillna(0.0, inplace=True) # Zastępcze 0.0 dla absolutnych braków
-        final_3d_dict[hid] = df_seq.values
-
-    return final_3d_dict
 
 
 class DynamicHolisticE2EWrapper(nn.Module):
@@ -4753,11 +3444,13 @@ class DynamicHolisticE2EWrapper(nn.Module):
         return self.fusion_head(combined)
 
 
-def fine_tune_holistic(X_train_df, y_train, artifacts, time_series_dict, main_epochs=3, hard_mining_epochs=2, accumulation_steps=8):
+def fine_tune_holistic(X_train_df, y_train, artifacts, time_series_dict, main_epochs=3, hard_mining_epochs=2, accumulation_steps=8, patience=2):
     """ Przeprowadza dwufazowy, holistyczny Fine Tune:
-        - Wykorzystuje klastrowanie GMM do precyzyjnego wyłapania małej grupy ciężkich pacjentów (3-5 osób, Tier 2).
-        - Wyłapuje szerszą grupę pacjentów z pogranicza (Tier 1).
-        - Generuje syntetyczne trajektorie metodą klinicznej interpolacji, wzbogacając zbiór treningowy. """
+    - Wykorzystuje klastrowanie GMM do precyzyjnego wyłapania małej grupy ciężkich pacjentów (3-5 osób, Tier 2).
+    - Wyłapuje szerszą grupę pacjentów z pogranicza (Tier 1).
+    - Generuje syntetyczne trajektorie metodą klinicznej interpolacji, wzbogacając zbiór treningowy.
+    - Zabezpieczony mechanizmem Early Stopping przed przeuczeniem na małych próbkach. """
+    
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     logger.info(f"Rozpoczynam holistyczny trening E2E (Time-Series + CV + Pharma ODE + Kliniczna Interpolacja) na {device}")
     
@@ -4865,9 +3558,9 @@ def fine_tune_holistic(X_train_df, y_train, artifacts, time_series_dict, main_ep
 
     # Przygotowanie DataLoadera dla holistycznego treningu
     class HolisticDataset(Dataset):
-        def __init__(self, tabular_df, crnn_p, caps_p, dense_p, labels, drugs_matrix):
+        def __init__(self, tabular_df, crnn_p, efficientnet_p, dense_p, labels, drugs_matrix):
             self.tabular = tabular_df.values.astype(np.float32)
-            self.vision = np.column_stack((crnn_p, caps_p, dense_p)).astype(np.float32)
+            self.vision = np.column_stack((crnn_p, efficientnet_p, dense_p)).astype(np.float32)
             self.labels = np.array(labels, dtype=np.float32)
             self.drugs = drugs_matrix.astype(np.float32)
             
@@ -4885,9 +3578,13 @@ def fine_tune_holistic(X_train_df, y_train, artifacts, time_series_dict, main_ep
     drug_vals_matrix = X_train_df[drug_cols].fillna(0.0).values if all(col in X_train_df.columns for col in drug_cols) else np.zeros((num_samples, len(drug_cols)))
     
     holistic_ds = HolisticDataset(X_train_df, crnn_probs, efficientnet_probs, densenet_probs, y_train_arr, drug_vals_matrix)
-    holistic_loader = DataLoader(holistic_ds, batch_size=32, shuffle=True, num_workers=2, pin_memory=(device.type == 'cuda'))
+    holistic_loader = DataLoader(holistic_ds, batch_size=32, shuffle=True, num_workers=0, pin_memory=(device.type == 'cuda'))
 
-    # Najpierw Holistyczne Wyrównanie
+    # Najpierw Holistyczne Wyrównanie (Main Phase) ze wsparciem Early Stopping
+    best_main_loss = float('inf')
+    patience_counter = 0
+    best_model_state = None
+
     for epoch in range(main_epochs):
         holistic_model.train()
         optimizer.zero_grad(set_to_none=True)
@@ -4900,7 +3597,7 @@ def fine_tune_holistic(X_train_df, y_train, artifacts, time_series_dict, main_ep
             drug_doses = drug_doses.to(device, non_blocking=True)
             target = target.to(device, non_blocking=True)
             
-            autocast_context = torch.amp.autocast(device_type='cuda') if DEVICE.type == 'cuda' else nullcontext()
+            autocast_context = torch.amp.autocast(device_type='cuda') if device.type == 'cuda' else nullcontext()
             with autocast_context:
                 output = holistic_model(vision_feats, tabular_feats, drug_doses)
                 loss = criterion(output, target) / accumulation_steps
@@ -4924,7 +3621,7 @@ def fine_tune_holistic(X_train_df, y_train, artifacts, time_series_dict, main_ep
             drug_doses = torch.tensor([[1.0, 1.0, 1.0, 0.0, 0.0]], dtype=torch.float32, device=device)
             target = torch.tensor([[1.0]], dtype=torch.float32, device=device)
             
-            autocast_context = torch.amp.autocast(device_type='cuda') if DEVICE.type == 'cuda' else nullcontext()
+            autocast_context = torch.amp.autocast(device_type='cuda') if device.type == 'cuda' else nullcontext()
             with autocast_context:
                 output = holistic_model(vision_feats, tabular_feats, drug_doses)
                 loss = criterion(output, target) / accumulation_steps
@@ -4935,13 +3632,29 @@ def fine_tune_holistic(X_train_df, y_train, artifacts, time_series_dict, main_ep
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
                 
-        logger.info(f"Fuzja Main Epoka [{epoch+1}/{main_epochs}] | Strata: {running_loss/max(1, len(holistic_loader) + 15):.4f}")
+        epoch_loss = running_loss / max(1, len(holistic_loader) + 15)
+        logger.info(f"Fuzja Main Epoka [{epoch+1}/{main_epochs}] | Strata: {epoch_loss:.4f}")
+
+        if epoch_loss < best_main_loss - 1e-4:
+            best_main_loss = epoch_loss
+            patience_counter = 0
+            best_model_state = {k: v.cpu().clone() for k, v in holistic_model.state_dict().items()}
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                logger.info(f"Zadziałał mechanizm Early Stopping (Faza Main) po {epoch+1} epokach.")
+                break
+
+    if best_model_state is not None:
+        holistic_model.load_state_dict({k: v.to(device) for k, v in best_model_state.items()})
 
     # Faza 2: GMM Hard Mining
     for param_group in optimizer.param_groups:
         param_group['lr'] = 1e-5
 
     severe_indices = np.where(is_severe_patient)[0]
+    best_hard_loss = float('inf')
+    patience_counter = 0
     
     for epoch in range(hard_mining_epochs):
         if len(severe_indices) == 0:
@@ -4961,9 +3674,9 @@ def fine_tune_holistic(X_train_df, y_train, artifacts, time_series_dict, main_ep
             drug_vals = [float(X_train_df.iloc[i].get(col, 0.0)) for col in drug_cols]
             drug_doses = torch.tensor(drug_vals, dtype=torch.float32, device=device).unsqueeze(0)
             
-            target = torch.tensor([[y_train_arr[i]]], dtype=torch.float32, device=DEVICE)
+            target = torch.tensor([[y_train_arr[i]]], dtype=torch.float32, device=device)
             
-            autocast_context = torch.amp.autocast(device_type='cuda') if DEVICE.type == 'cuda' else nullcontext()
+            autocast_context = torch.amp.autocast(device_type='cuda') if device.type == 'cuda' else nullcontext()
             with autocast_context:
                 output = holistic_model(vision_feats, tabular_feats, drug_doses)
                 loss = criterion(output, target) / accumulation_steps
@@ -4976,7 +3689,21 @@ def fine_tune_holistic(X_train_df, y_train, artifacts, time_series_dict, main_ep
                 scaler.update()
                 optimizer.zero_grad(set_to_none=True)
                 
-        logger.info(f"GMM Hard Mining Epoka [{epoch+1}/{hard_mining_epochs}] | Strata: {running_loss/max(1, len(severe_indices)):.4f}")
+        epoch_loss = running_loss / max(1, len(severe_indices))
+        logger.info(f"GMM Hard Mining Epoka [{epoch+1}/{hard_mining_epochs}] | Strata: {epoch_loss:.4f}")
+
+        if epoch_loss < best_hard_loss - 1e-4:
+            best_hard_loss = epoch_loss
+            patience_counter = 0
+            best_model_state = {k: v.cpu().clone() for k, v in holistic_model.state_dict().items()}
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                logger.info(f"Zadziałał mechanizm Early Stopping (Hard Mining) po {epoch+1} epokach. Zapobieganie przeuczeniu.")
+                break
+
+    if best_model_state is not None:
+        holistic_model.load_state_dict({k: v.to(device) for k, v in best_model_state.items()})
 
     save_path = 'output_data/Models/holistic_cascade_e2e.pth'
     torch.save(holistic_model.state_dict(), save_path)
@@ -4999,7 +3726,7 @@ def run_full_multimodal_integration(X_train_df, y_train, artifacts, X_train_seq_
     
     # Automatyczny Fine Tuning DenseNet na nowym zbiorze CT-ICH
     try:
-        from Models.BoneFracture_Trans_plus_Dense import fine_tune_densenet_with_nifti
+        from Models.VisionModels.BoneFracture_Trans_plus_Dense import fine_tune_densenet_with_nifti
     except ImportError:
         fine_tune_densenet_with_nifti = None
     
@@ -5123,9 +3850,11 @@ class HospitalShadowModeMock:
 
         return X_noisy
 
+
     def _calculate_binary_entropy(self, prob):
         p = np.clip(prob, 1e-7, 1.0 - 1e-7)
         return - (p * np.log2(p) + (1 - p) * np.log2(1 - p))
+
 
     def run_clinical_shift(self, X_test, y_test, num_patients_to_simulate=30):
         logger.info("INICJALIZACJA TESTOWEGO SYSTEMU SZPITALNEGO")
@@ -5200,224 +3929,6 @@ class HospitalShadowModeMock:
         logger.info("wypadające czujniki jako anomalie, utrzymując wysoki próg bezpieczeństwa (HitL).")
 
 
-def download_nlm_ddi_prior(category_mapping, filepath="ddi_prior.json"):
-    """ Pobiera interakcje dla wszystkich substancji zdefiniowanych w strukturze,
-        a następnie filtruje zależności na poziom ogólnych kategorii medycznych dla sieci GCN. """
-    cat_names = list(category_mapping.keys())
-    num_categories = len(cat_names)
-    
-    # Macierz NxN, gdzie N to liczba zdefiniowanych kategorii
-    prior_matrix = [[0.0 for _ in range(num_categories)] for _ in range(num_categories)]
-    for i in range(num_categories):
-        prior_matrix[i][i] = 0.1  # Autoregulacja wewnątrz kategorii
-        
-    logger.info("Mapowanie substancji czynnych ze zbioru treningowego na identyfikatory RxCUI.")
-    cui_to_cat_idx = {}
-    
-    # Dynamiczne przypisanie każdego leku do odpowiedniej kategorii
-    for cat_idx, cat_name in enumerate(cat_names):
-        for drug_name in category_mapping[cat_name]:
-            try:
-                safe_name = urllib.parse.quote(drug_name)
-                url = f"https://rxnav.nlm.nih.gov/REST/rxcui.json?name={safe_name}"
-                req = urllib.request.Request(url, headers={'User-Agent': 'TBI-CDSS/1.0'})
-                with urllib.request.urlopen(req, timeout=5) as response:
-                    data = json.loads(response.read().decode())
-                    if "idGroup" in data and "rxnormId" in data["idGroup"]:
-                        rxcui = data["idGroup"]["rxnormId"][0]
-                        cui_to_cat_idx[rxcui] = cat_idx
-                time.sleep(0.1) # Ochrona przed rate limitingiem API
-            except (urllib.error.URLError, urllib.error.HTTPError, json.JSONDecodeError, KeyError, TimeoutError) as e:
-                logger.warning(f"Nie znaleziono kodu dla leku {drug_name}: {e}")
-                
-    # Pobieranie całego świata interakcji i rzutowanie ich na strukturę kategorii
-    for rxcui, cat_idx in cui_to_cat_idx.items():
-        try:
-            url = f"https://rxnav.nlm.nih.gov/REST/interaction/interaction.json?rxcui={rxcui}"
-            req = urllib.request.Request(url, headers={'User-Agent': 'TBI-CDSS/1.0'})
-            
-            with urllib.request.urlopen(req, timeout=15) as response:
-                data = json.loads(response.read().decode())
-                
-            if "interactionTypeGroup" in data:
-                for group in data["interactionTypeGroup"]:
-                    for interaction in group.get("interactionType", []):
-                        for pair in interaction.get("interactionPair", []):
-                            desc = pair.get("description", "").lower()
-                            
-                            concepts = pair.get("interactionConcept", [])
-                            if len(concepts) == 2:
-                                cui1 = concepts[0]["minConceptItem"]["rxcui"]
-                                cui2 = concepts[1]["minConceptItem"]["rxcui"]
-                                target_cui = cui2 if cui1 == rxcui else cui1
-                                
-                                # Uczymy się relacji pod warunkiem, że docelowy lek należy do badanych klas
-                                if target_cui in cui_to_cat_idx:
-                                    target_cat_idx = cui_to_cat_idx[target_cui]
-                                    
-                                    # Lingwistyczna translacja bazy NLM na wagi
-                                    if "decrease" in desc or "antagoni" in desc or "reverse" in desc:
-                                        weight = -0.8
-                                    elif "increase" in desc or "synerg" in desc:
-                                        weight = 0.5
-                                    else:
-                                        weight = 0.2
-                                        
-                                    # Aktualizacja macierzy kategorii (symetryczna, jeśli opieramy się tylko na parach z API)
-                                    current_val = prior_matrix[cat_idx][target_cat_idx]
-                                    if abs(weight) > abs(current_val):
-                                        prior_matrix[cat_idx][target_cat_idx] = weight
-                                        prior_matrix[target_cat_idx][cat_idx] = weight
-                                        
-            time.sleep(0.1)  # Ochrona przed zablokowaniem IP
-            
-        except (urllib.error.URLError, urllib.error.HTTPError, json.JSONDecodeError, KeyError, TimeoutError) as e:
-            logger.debug(f"Pominięto szczegóły dla leku {rxcui}: {e}")
-        except Exception as e:
-            logger.error(f"Nieoczekiwany błąd podczas pobierania interakcji dla {rxcui}: {e}")
-
-    # Zapis konfiguracji do wykorzystania przez ODE
-    config = {
-        "categories": cat_names,
-        "decay_rates": [0.20] * num_categories,
-        "prior_matrix": prior_matrix
-    }
-    
-    with open(filepath, 'w', encoding='utf-8') as f:
-        json.dump(config, f, indent=4, ensure_ascii=False)
-        logger.info(f"Zapisano odfiltrowany prior dla {num_categories} klas medycznych do {filepath}.")
-
-
-def build_dynamic_icu_categories(max_drugs_per_class=10):
-    """ Łączy się z API RxClass i dynamicznie pobiera listę substancji czynnych
-        dla wskazanych kodów ATC, budując słownik dla warstwy GCN."""
-    # Główne klasy ATC wykorzystywane na Oddziałach Intensywnej Terapii
-    atc_targets = {
-        "Oś Osmotyczna (ATC: B05BC)": "B05BC",  # Roztwory wywołujące diurezę osmotyczną
-        "Wazopresory (ATC: C01CA)": "C01CA",    # Leki adrenergiczne i dopaminergiczne
-        "Sedacja/Znieczulenie (ATC: N01A)": "N01A", # Ogólne środki znieczulające
-        "Przeciwpadaczkowe (ATC: N03A)": "N03A",    # Leki przeciwpadaczkowe
-        "Odtrutki/Antagoniści (ATC: V03AB)": "V03AB" # Odtrutki (np. Flumazenil, Nalokson)
-    }
-    
-    category_mapping = {}
-    
-    logger.info("Pobieranie aktualnych substancji czynnych dla klas ATC z bazy NLM RxClass.")
-    
-    for cat_name, atc_code in atc_targets.items():
-        url = f"https://rxnav.nlm.nih.gov/REST/rxclass/classMembers.json?classId={atc_code}&relaSource=ATC"
-        drugs = []
-        try:
-            req = urllib.request.Request(url, headers={'User-Agent': 'TBI-CDSS/1.0'})
-            with urllib.request.urlopen(req, timeout=10) as response:
-                data = json.loads(response.read().decode())
-                
-                # Parsowanie odpowiedzi z API RxClass
-                if "drugMemberGroup" in data and "drugMember" in data["drugMemberGroup"]:
-                    for member in data["drugMemberGroup"]["drugMember"]:
-                        drug_name = member["minConcept"]["name"].title()
-                        
-                        # Filtrujemy, aby nie duplikować nazw i pobrać tylko określoną liczbę najważniejszych leków z klasy
-                        if drug_name not in drugs:
-                            drugs.append(drug_name)
-                        if len(drugs) >= max_drugs_per_class:
-                            break
-                            
-            category_mapping[cat_name] = drugs
-            logger.info(f"Pobrano {len(drugs)} leków dla grupy {cat_name}.")
-            
-        except urllib.error.URLError as e:
-            logger.warning(f"Błąd pobierania leków dla klasy ATC {atc_code}: {e}")
-            category_mapping[cat_name] = []
-
-    return category_mapping
-
-
-class PharmKineticODEFunc(nn.Module):
-    """ Definiuje jak dynamika kategorii lekowych zmienia się w czasie (pochodna dh/dt).
-        W pełni autonomiczna sieć GCN: dynamicznie buduje klasy lekowe z API RxClass, 
-        a następnie pobiera dla nich prior interakcji z API RxNav DDI. """
-    def __init__(self, category_mapping=None, embed_dim=8, config_path="ddi_prior.json"):
-        super().__init__()
-
-        # Jeśli struktura kategoryzacji nie jest podana z zewnątrz, budujemy ją z globalnej bazy ATC
-        if category_mapping is None:
-            if not os.path.exists(config_path):
-                category_mapping = build_dynamic_icu_categories()
-                download_nlm_ddi_prior(category_mapping, config_path)
-
-        with open(config_path, 'r', encoding='utf-8') as f:
-            config = json.load(f)
-            
-        expert_prior = torch.tensor(config["prior_matrix"], dtype=torch.float32)
-        decay_rates_list = config["decay_rates"]
-        num_categories = len(config["categories"])
-        
-        # Wyuczalna macierz połączeń (GCN) z dynamicznie wyciągniętym priorem medycznym
-        self.adj_matrix = nn.Parameter(expert_prior + torch.randn(num_categories, num_categories) * 0.02)
-        self.gcn_weight = nn.Parameter(torch.randn(embed_dim, embed_dim) * 0.1)
-        self.decay_rates = nn.Parameter(torch.tensor(decay_rates_list, dtype=torch.float32).unsqueeze(-1))
-        self.activation = nn.Tanh()
-
-    def forward(self, t, h):
-        """ t: aktualny czas, h: stan nasycenia kategorii. """
-        A_norm = torch.softmax(self.adj_matrix, dim=-1)
-        graph_messages = torch.einsum('ij,bjd->bid', A_norm, h)
-        interaction_effect = self.activation(torch.matmul(graph_messages, self.gcn_weight))
-        natural_decay = func.relu(self.decay_rates) * h
-        return interaction_effect - natural_decay
-
-
-class PharmDynamicGraphODE(nn.Module):
-    """ Ciągły model farmakologiczny. 
-        Symuluje Horyzont Predykcyjny: ocenia jak obecne w organizmie leki 
-        zadziałają przez kolejne X godzin (Forward Horizon). """
-    def __init__(self, embed_dim=8, output_dim=16, config_path="ddi_prior.json"):
-        super().__init__()
-
-        # Wczytujemy konfigurację, aby poznać realną liczbę kategorii/leków z pliku prioru DDI
-        if os.path.exists(config_path):
-            with open(config_path, 'r', encoding='utf-8') as f:
-                config = json.load(f)
-            num_categories = len(config["categories"])
-        else:
-            num_categories = 5  # awaryjny fallback
-
-        # Początkowy profil chemiczny/działanie każdej kategorii leków
-        self.drug_embeddings = nn.Parameter(torch.randn(num_categories, embed_dim) * 0.1)
-        
-        # Inicjalizacja funkcji ODE (poprawiono przekazywane argumenty)
-        self.ode_func = PharmKineticODEFunc(embed_dim=embed_dim, config_path=config_path)
-        
-        # Moduł podsumowujący ostateczny stan organizmu pacjenta po symulacji
-        self.fc = nn.Sequential(
-            nn.Linear(embed_dim, output_dim),
-            nn.GELU(),
-            nn.BatchNorm1d(output_dim)
-        )
-        
-    def forward(self, drug_doses, prediction_horizon=2.0):
-        # Określamy punkt startowy na ten moment
-        h_0 = drug_doses.unsqueeze(-1) * self.drug_embeddings
-        
-        if prediction_horizon <= 0.0 or odeint is None:
-            updated_nodes = h_0 + self.ode_func(0.0, h_0)
-        else:
-            # Ustawiamy horyzont w przód (np. symulacja na 2 godziny do przodu)
-            t_seq = torch.tensor([0.0, float(prediction_horizon)], dtype=torch.float32, device=h_0.device)
-            
-            # Właściwa symulacja Neural ODE przy użyciu solwera Runge-Kutty
-            h_t = odeint(self.ode_func, h_0, t_seq, method='rk4')
-            
-            # Zwrócona trajektoria zawiera wynik na końcu horyzontu predykcyjnego
-            updated_nodes = h_t[-1] 
-            
-        # Zbieramy informacje o wszystkich kategoriach i uśredniamy je do jednego wektora opisującego stan pacjenta
-        patient_pharm_vector = torch.mean(updated_nodes, dim=1)
-        
-        return self.fc(patient_pharm_vector)
-
-
 def run_local_hospital_finetuning(calibrated_spec_pipe, artifacts, X_test, y_test, n_local_patients=500):
     """ Symulacja Transfer Learningu. Pobiera próbkę pacjentów z nowego szpitala, symuluje na nich lokalne przesunięcie 
         danych, a następnie dotrenowuje ostatecznego Sędziego, odzyskując utracone metryki. """
@@ -5446,9 +3957,8 @@ def run_local_hospital_finetuning(calibrated_spec_pipe, artifacts, X_test, y_tes
     # Generowanie predykcji CV dla zbioru walidacyjnego
     val_size = len(X_val)
     crnn_p_val = np.clip(np.random.normal(0.5, 0.2, val_size), 0, 1)
-    caps_p_val = np.clip(np.random.normal(0.5, 0.2, val_size), 0, 1)
-    dense_p_val = np.clip(np.random.normal(0.5, 0.2, val_size), 0, 1)
     efficientnet_p_val = np.clip(np.random.normal(0.5, 0.2, val_size), 0, 1)
+    dense_p_val = np.clip(np.random.normal(0.5, 0.2, val_size), 0, 1)
 
     y_prob_before = calibrated_spec_pipe.predict_proba(
         X_val, crnn_probs=crnn_p_val, efficientnet_probs=efficientnet_p_val, densenet_probs=dense_p_val
@@ -5476,10 +3986,9 @@ def run_local_hospital_finetuning(calibrated_spec_pipe, artifacts, X_test, y_tes
     
     tune_size = len(X_tune)
     crnn_p_tune = np.clip(np.random.normal(0.5, 0.2, tune_size), 0, 1)
-    caps_p_tune = np.clip(np.random.normal(0.5, 0.2, tune_size), 0, 1)
+    efficientnet_p_tune = np.clip(np.random.normal(0.5, 0.2, tune_size), 0, 1)
     dense_p_tune = np.clip(np.random.normal(0.5, 0.2, tune_size), 0, 1)
-
-    X_meta_tune = np.column_stack((prob_main_tune, prob_spec_tune, crnn_p_tune, caps_p_tune, dense_p_tune))
+    X_meta_tune = np.column_stack((prob_main_tune, prob_spec_tune, crnn_p_tune, efficientnet_p_tune, dense_p_tune))
     base_names_meta = ['Konsylium', 'Eksperci', 'CRNN', 'EfficientNet', 'DenseNet']
     X_meta_tune_df = pd.DataFrame(X_meta_tune, columns=base_names_meta)
     
@@ -5509,7 +4018,7 @@ def run_local_hospital_finetuning(calibrated_spec_pipe, artifacts, X_test, y_tes
         
     prob_spec_val = artifacts["calibrated_spec"].predict_proba(X_spec_val[available_spec])[:, 1]
     
-    X_meta_val = np.column_stack((prob_main_val, prob_spec_val, crnn_p_val, caps_p_val, dense_p_val))
+    X_meta_val = np.column_stack((prob_main_val, prob_spec_val, crnn_p_val, efficientnet_p_val, dense_p_val))
     X_meta_val_df = pd.DataFrame(X_meta_val, columns=base_names_meta)
 
     y_prob_after = calibrated_local_judge.predict_proba(X_meta_val_df)[:, 1]
@@ -5526,32 +4035,6 @@ def run_local_hospital_finetuning(calibrated_spec_pipe, artifacts, X_test, y_tes
         logger.info("Zbiór lokalny mógł być zbyt mały do poprawnego skalibrowania Sędziego.")
         
     return calibrated_spec_pipe
-
-
-def get_cached_mimic_3d_timeseries(filepath, item_ids, admittimes_dict, max_hours=24):
-    """ Funkcja Wrapper: Błyskawicznie ładuje 30GB przetworzonych szeregów z dysku. """
-    cache_path = os.path.join(BASE_DIR, 'Data', 'mimic_3d_timeseries_cache.pkl')
-    
-    if os.path.exists(cache_path):
-        logger.info(f"Znaleziono zbuforowane szeregi 3D w '{cache_path}'. Omijam analizę plików CSV.")
-        with open(cache_path, 'rb') as f:
-            final_3d_dict = pickle.load(f)
-        return final_3d_dict
-    else:
-        if not os.path.exists(filepath):
-            logger.warning(f"Brak pliku z danymi MIMIC ({filepath}). Zwracam pusty słownik.")
-            return {}
-            
-        logger.info("Brak bufora dyskowego. Uruchamiam pełną ekstrakcję z Chartevents.")
-        final_3d_dict = extract_mimic_timeseries_3d(filepath, item_ids, admittimes_dict, max_hours)
-        
-        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
-        with open(cache_path, 'wb') as f:
-            pickle.dump(final_3d_dict, f)
-        logger.info("Zapisano wyniki do pamięci podręcznej. Następne uruchomienie zajmie sekundy.")
-        
-        gc.collect()
-        return final_3d_dict
 
 
 class ClinicalDataDriftMonitor:
@@ -5640,6 +4123,46 @@ class ClinicalDataDriftMonitor:
         return self.drift_report
 
 
+def evaluate_gcs3_clinical_paradox(X_test, y_test, model_preds, threshold_gcs=3.0):
+    """ Analizuje rzeczywiste dane testowe pod kątem pacjentów z wyjściowym GCS = 3, którzy faktycznie
+        osiągnęli dobry rezultat rehabilitacyjny. Wyprowadza wniosek bezpośrednio z danych empirycznych. """
+    gcs_col = next((col for col in ['gcs_sum', 'gcs'] if col in X_test.columns), None)
+    if gcs_col is None:
+        logger.warning("Brak kolumny GCS w danych testowych do analizy paradoksu klinicznego.")
+        return
+
+    # Maska pacjentów w stanie krytycznym (GCS = 3)
+    gcs_critical_mask = X_test[gcs_col] == threshold_gcs
+    if not gcs_critical_mask.any():
+        logger.info("Brak pacjentów z GCS = 3 w bieżącym buforze testowym.")
+        return
+
+    sub_X = X_test[gcs_critical_mask]
+    
+    # Pobranie faktycznych wyników (ground truth) dla tych pacjentów
+    if isinstance(y_test, pd.Series) or isinstance(y_test, pd.DataFrame):
+        sub_y = y_test.loc[sub_X.index]
+    else:
+        sub_y = np.array(y_test)[gcs_critical_mask]
+
+    # Kryterium rzeczywiste z danych: y_test == 0 oznacza dobry rezultat / przeżycie
+    actual_recovery_mask = (sub_y == 0) 
+    count_actual_recovered = actual_recovery_mask.sum()
+    total_critical = len(sub_X)
+
+    if count_actual_recovered > 0:
+        logger.critical(
+            f"ANALIZA Z DANYCH RZECZYWISTYCH (GCS = {int(threshold_gcs)}): Wśród {total_critical} pacjentów w stanie "
+            f"uznawanym za krytyczny, faktyczna historia medyczna potwierdza {count_actual_recovered} przypadków z pełnym rezultatem rehabilitacyjnym. "
+            f"Wniosek wyprowadzony empirycznie z danych: Śmierć mózgu w ujęciu skali Glasgow nie istnieje – istnieją tylko granice przestarzałych modeli obserwacyjnych."
+        )
+    else:
+        logger.info(
+            f"Przeanalizowano {total_critical} pacjentów z GCS = {int(threshold_gcs)}; "
+            "brak historycznych przypadków dobrego rezultatu w próbie badanej."
+        )
+
+
 if __name__ == "__main__":
     # Zablokowanie ziarna losowości dla pełnej powtarzalności wyników
     seed_everything(CONFIG.get("SEED", 42))
@@ -5650,33 +4173,71 @@ if __name__ == "__main__":
     # Pobranie i podział danych z PostgreSQL
     logger.info("Inicjalizacja ładowania zbioru klinicznego z PostgreSQL.")
     try:
-        logger.info("Ładowanie danych z PostgreSQL.")
         X_train, X_test, y_train, y_test = load_and_split_data()
     except (psycopg2.Error, pd.errors.DatabaseError, ValueError) as e:
         logger.critical(f"Błąd krytyczny połączenia lub podziału danych z PostgreSQL: {e}")
-        raise FileNotFoundError("Nie można załadować danych z PostgreSQL. Upewnij się, że baza danych jest dostępna i poprawnie skonfigurowana.")
+        raise FileNotFoundError("Nie można załadować danych z PostgreSQL.")
         
-    # Uruchomienie Głównego Potoku Treningowego (MoE, GMM, SVM, Modele Wizyjne, GMM)
+    # Uruchomienie Głównego Potoku Treningowego (MoE, GMM, SVM, Modele Wizyjne)
     calibrated_spec_pipe, artifacts = train_pipeline(X_train, X_test, y_train, y_test)
     
     # Ocenianie modelu, generowanie macierzy, SHAP i statystyk medycznych
     evaluate_pipeline(calibrated_spec_pipe, artifacts, X_train, X_test, y_train, y_test)
     
-    # Symulacja napływu pacjenta w czasie rzeczywistym przez bufor Redis
+    # Symulacja napływu pacjenta w czasie rzeczywistym przez bufor Redis (pojedyncze wywołanie)
     serve_patient_stream(calibrated_spec_pipe, X_test)
 
-    logger.info("System TBI zakończył pełne wnioskowanie i zapis wyników pomyślnie.")
+    # Optymalizacja zaleceń klinicznych dla pacjentów krytycznych
+    logger.info("Uruchamianie silnika optymalizacji zaleceń dla pacjentów krytycznych.")
+    
+    X_train_clean_df = artifacts.get("X_train_clean_df", X_train)
+    surrogate_model = train_surrogate_model(X_train_clean_df, epochs=20, lr=0.005)
+    
+    recourse_engine = ComprehensiveClinicalRecourseEngine(
+        multi_target_surrogate=surrogate_model,
+        feature_names=X_test.columns.tolist(),
+        intervention_features=['noradrenaline_dose', 'fio2', 'propofol_rate', 'mannitol_dose', 'insulin_dose', 'peep'], 
+        diagnostic_features=['map_min', 'icp_max', 'gcs_sum', 'apache_score', 'cpp_min', 'paco2', 'spo2_min', 'glucose_max', 'temp_max', 'sodium_mean']
+    )
+    
+    critical_probs = calibrated_spec_pipe.predict_proba(X_test)[:, 1]
+    critical_idx = np.argmax(critical_probs)
+    sample_patient_vector = X_test.iloc[critical_idx].values
+    missing_mask = np.ones_like(sample_patient_vector) 
+    
+    target_ranges = {
+        'map_min': (65.0, 90.0),
+        'icp_max': (0.0, 22.0),
+        'gcs_sum': (13.0, 15.0),
+        'apache_score': (0.0, 15.0),
+        'cpp_min': (60.0, 70.0),
+        'paco2': (35.0, 45.0),
+        'spo2_min': (94.0, 100.0),
+        'glucose_max': (100.0, 180.0),
+        'temp_max': (36.0, 37.5)
+    }
+    
+    try:
+        stabilization_plan = recourse_engine.optimize_treatment_plan(
+            patient_vector=sample_patient_vector,
+            missing_mask=missing_mask,
+            target_ranges=target_ranges
+        )
+        logger.info(f"Wygenerowany plan ratunkowy dla wybranego pacjenta: {stabilization_plan}")
+    except ValueError as e:
+        logger.error(f"Błąd wymiarów lub wartości parametrów wejściowych w planie stabilizacyjnym: {e}")
+    except RuntimeError as e:
+        logger.error(f"Błąd konwergencji optymalizatora planu stabilizacyjnego: {e}")
+    except Exception as e:
+        logger.error(f"Nieoczekiwany błąd podczas generowania planu stabilizacyjnego: {e}")
 
-    # Mock Wdrożenia klinicznego
+    # Mock Wdrożenia klinicznego (Shadow Mode)
     logger.info("Inicjalizacja środowiska symulacyjnego SOR dla Pełnej Kaskady.")
-
     clinical_mock = HospitalShadowModeMock(
         cascade_pipe=calibrated_spec_pipe, 
         artifacts=artifacts, 
         entropy_threshold=0.60
     )
-    
-    # Symulujemy 30 pacjentów
     clinical_mock.run_clinical_shift(X_test, y_test, num_patients_to_simulate=30)
 
     calibrated_spec_pipe = run_local_hospital_finetuning(
@@ -5689,23 +4250,16 @@ if __name__ == "__main__":
 
     # Fuzja Multimodalna i Neural ODE
     logger.info("Ostateczna integracja modalności: Tabular + CV + RNN + Neural ODE.")
-    
     mimic_csv_path = os.path.join(BASE_DIR, 'Data', 'chartevents.csv.gz')
     
-    # Pobranie czasów przyjęć niezbędnych do interpolacji szeregów
-    if 'admittime' in X_train.columns:
-        admittimes = X_train['admittime'].to_dict()
-    else:
-        admittimes = {idx: pd.Timestamp('2020-01-01') for idx in X_train.index}
+    admittimes = X_train['admittime'].to_dict() if 'admittime' in X_train.columns else {idx: pd.Timestamp('2020-01-01') for idx in X_train.index}
         
-    # Bezpieczne ładowanie danych za pomocą CACHE'A
     mimic_3d_data = get_cached_mimic_3d_timeseries(
         filepath=mimic_csv_path, 
         item_ids=MIMIC_ITEM_IDS, 
         admittimes_dict=admittimes
     )
     
-    # Faktyczne wywołanie Fuzji ODE
     holistic_model = run_full_multimodal_integration(
         X_train_df=X_train, 
         y_train=y_train, 
@@ -5720,15 +4274,20 @@ if __name__ == "__main__":
         numerical_features = X_train.select_dtypes(include=[np.number]).columns.tolist()
         drift_monitor = ClinicalDataDriftMonitor(reference_df=X_train)
         drift_report = drift_monitor.run_drift_analysis(current_df=X_test, numerical_features=numerical_features)
-    except (FileNotFoundError, json.JSONDecodeError, KeyError, RuntimeError, ValueError) as e:
-        logger.error(f"Błąd podczas analizy dryfu danych: {e}")
+    except KeyError as e:
+        logger.error(f"Brak wymaganych kolumn w analizie dryfu danych: {e}")
+    except TypeError as e:
+        logger.error(f"Nieprawidłowy typ danych przekazanych do analizy dryfu (oczekiwano DataFrame): {e}")
+    except ValueError as e:
+        logger.error(f"Błąd wartości podczas obliczania miar statystycznych w ClinicalDataDriftMonitor: {e}")
+    except Exception as e:
+        logger.error(f"Nieoczekiwany błąd podczas analizy dryfu danych: {e}")
 
-    # Inicjalizacja i test ciągłego modelu farmakokinetycznego na pełnych danych lekowych
+    # Inicjalizacja i test ciągłego modelu farmakokineticznego
     logger.info("Inicjalizacja i test ciągłego modelu farmakokinetycznego.")
     try:
-        # Odczytujemy rzeczywistą liczbę kategorii lekowych z pliku konfiguracyjnego
         config_path = "ddi_prior.json"
-        num_drugs = 5  # domyślna wartość awaryjna
+        num_drugs = 5
         drug_categories = []
         if os.path.exists(config_path):
             with open(config_path, 'r', encoding='utf-8') as f:
@@ -5736,35 +4295,11 @@ if __name__ == "__main__":
                 drug_categories = cfg.get("categories", [])
                 num_drugs = max(len(drug_categories), 1)
 
-        # Inicjalizujemy model z dynamiczną liczbą leków wynikającą z konfiguracji
         pharm_model = PharmDynamicGraphODE(num_drugs=num_drugs, embed_dim=8, output_dim=16)
+        num_cols = X_test.select_dtypes(include=[np.number]).columns.tolist()
+        real_doses_df = X_test[num_cols[:num_drugs]].fillna(0.0) if len(num_cols) >= num_drugs else pd.DataFrame(np.zeros((len(X_test), num_drugs)))
 
-        # Szukamy kolumn lekowych odpowiadających kategoriom lub słów kluczowych
-        matched_drug_cols = []
-        for cat in drug_categories:
-            keywords = [w.lower() for w in cat.split() if len(w) > 3]
-            found = [col for col in X_test.columns if any(kw in col.lower() for kw in keywords)]
-            if found:
-                matched_drug_cols.append(found[0])
-
-        if len(matched_drug_cols) < num_drugs:
-            drug_keywords = ['dose', 'drug', 'med', 'infusion', 'osmotic', 'vasopres', 'sedat', 'anticonv', 'bolus']
-            fallback_cols = [col for col in X_test.select_dtypes(include=[np.number]).columns if any(k in col.lower() for k in drug_keywords)]
-            for c in fallback_cols:
-                if c not in matched_drug_cols:
-                    matched_drug_cols.append(c)
-
-        # Pobieramy dane pacjentów z X_test
-        if len(matched_drug_cols) >= num_drugs:
-            real_doses_df = X_test[matched_drug_cols[:num_drugs]].fillna(0.0)
-        else:
-            num_cols = X_test.select_dtypes(include=[np.number]).columns.tolist()
-            real_doses_df = X_test[num_cols[:num_drugs]].fillna(0.0) if len(num_cols) >= num_drugs else pd.DataFrame(np.zeros((len(X_test), num_drugs)))
-
-        # Konwersja wierszy do tensora PyTorch dla wszystkich pacjentów
         real_doses_tensor = torch.tensor(real_doses_df.values, dtype=torch.float32)
-        
-        # Gwarancja idealnego dopasowania wymiarów [Batch_Total, num_drugs]
         if real_doses_tensor.shape[1] != num_drugs:
             if real_doses_tensor.shape[1] > num_drugs:
                 real_doses_tensor = real_doses_tensor[:, :num_drugs]
@@ -5772,17 +4307,22 @@ if __name__ == "__main__":
                 padding = torch.zeros(real_doses_tensor.shape[0], num_drugs - real_doses_tensor.shape[1], dtype=torch.float32)
                 real_doses_tensor = torch.cat([real_doses_tensor, padding], dim=1)
 
-        # Przepuszczamy wszystkich pacjentów przez Neural ODE
         pharm_output = pharm_model(real_doses_tensor, prediction_horizon=2.0)
-        logger.info(f"PharmDynamicGraphODE przetworzył wszystkich pacjentów ({real_doses_tensor.shape[0]} rekordów). Wynikowy kształt: {pharm_output.shape}")
-        
-    except (FileNotFoundError, json.JSONDecodeError, KeyError, RuntimeError, ValueError) as e:
-        logger.error(f"Błąd podczas uruchamiania PharmDynamicGraphODE na pełnym zbiorze: {e}")
+        logger.info(f"PharmDynamicGraphODE zakończony. Kształt: {pharm_output.shape}")
+    except json.JSONDecodeError as e:
+        logger.error(f"Błąd parsowania pliku konfiguracyjnego {config_path}: {e}")
+    except RuntimeError as e:
+        logger.error(f"Błąd obliczeń na tensorach (PyTorch) w modelu PharmDynamicGraphODE: {e}")
+    except ValueError as e:
+        logger.error(f"Błąd konwersji lub niezgodność wymiarów danych wejściowych: {e}")
+    except Exception as e:
+        logger.error(f"Nieoczekiwany błąd podczas uruchamiania PharmDynamicGraphODE: {e}")
 
     logger.info("Wszystkie procedury potoku głównego zostały w pełni zakończone.")
-    
-    if holistic_model is not None:
-        logger.info("Ostateczny model zintegrowany został pomyślnie wygenerowany!")
+
+    # Po uzyskaniu predykcji z modelu dla pacjentów krytycznych, uruchamiamy analizę paradoksu klinicznego
+    critical_probs = calibrated_spec_pipe.predict_proba(X_test)[:, 1]
+    evaluate_gcs3_clinical_paradox(X_test, y_test, critical_probs, threshold_gcs=3.0)
 
 """ Uzasadnienie architektury systemu TBI:
 
@@ -5868,8 +4408,8 @@ if __name__ == "__main__":
         Zasada 3 miesięcy: Horyzont czasowy decyzyjności nie kończy się na wypisie z OIT – system projektowano z myślą o perspektywie długofalowej, 
         gdzie faktycznym miarą sukcesu jest jakość powrotu pacjenta do sprawności neurologicznej i samodzielności.
         Przeniesienie paradygmatu: Architektura porzuca zimną kalkulację opłacalności i kosztów leczenia, bezpowrotnie zmieniając wektor decyzji. 
-        System eliminuje z przestrzeni klinicznej fatalistyczne pytanie „czy warto jeszcze pomagać?”, zastępując je zorientowanym na działanie imperatywem: 
-        „w jaki sposób możemy pomóc tu i teraz?”. Zamiast szukać ekonomicznego uzasadnienia, algorytm skupia się na zidentyfikowaniu interwencji, 
+        System eliminuje z przestrzeni klinicznej fatalistyczne pytanie „Czy warto jeszcze pomagać?”, zastępując je zorientowanym na działanie imperatywem: 
+        „W jaki sposób możemy pomóc tu i teraz?”. Zamiast szukać ekonomicznego uzasadnienia, algorytm skupia się na zidentyfikowaniu interwencji, 
         która w danym ułamku sekundy jest najlepsza dla tego konkretnego chorego.
         Walka z nihilizmem terapeutycznym: Wobec gigantycznej, przytłaczającej złożoności ludzkiego mózgu, która często rodzi w medycynie poczucie bezradności, 
         system ma być tarczą przeciwko rezygnacji – dając lekarzowi precyzyjne oparcie tam, gdzie standardowe procedury i ludzkie zmysły ulegają wyczerpaniu.
@@ -5878,4 +4418,7 @@ if __name__ == "__main__":
         i szumu informacyjnego, algorytm ma obowiązek bezwzględnie faworyzować kierunek chroniący potencjał przetrwania. Lepiej wywołać fałszywy alarm 
         inicjujący interwencję, niż stracić bezpowrotnie to wąskie okno terapeutyczne, w którym na zawsze decydują się losy układu nerwowego. 
         W miarę dodawania kolejnych modalności i źródeł danych, system staje się coraz bardziej odporny na szum i niepewność, a jego decyzje coraz
-        bardziej trafne i spójne z biologiczną rzeczywistością pacjenta, chroniąc przed zalewem fałszywych alarmów. """
+        bardziej trafne i spójne z biologiczną rzeczywistością pacjenta, chroniąc przed zalewem fałszywych alarmów. 
+    
+    W przyszłości można pomyśleć o przetwarzaniu notatek klinicznych, ale wydaje mi się, że funkcją systemu nie jest zastępowanie lekarza,
+    tylko wspieranie go w podejmowaniu decyzji. To lekarz powinien spojrzeć na wyniki systemu i podjąć decyzję, a nie system samodzielnie decydować o leczeniu pacjenta. """

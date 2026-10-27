@@ -58,26 +58,26 @@ from tqdm import tqdm
 load_dotenv()
 
 # Inicjalizacja systemu logowania
-def setup_logger(name: str = "crnn"):
-    """ Centralny logger: konsole kieruje przez tqdm.write (nie rozbija paskow postepu),
-        a kopie zapisuje do pliku. Zabezpieczony przed podwojna rejestracja handlerow. """
+def setup_logger(name="UNet->EfficientNet", level=logging.INFO):
+    """ Centralny logger z przekierowaniem przez tqdm.write i zapisem do pliku. """
     logger = logging.getLogger(name)
     if logger.handlers:
         return logger
-    logger.setLevel(logging.INFO)
+    logger.setLevel(level)
     logger.propagate = False
 
     fmt = logging.Formatter('[%(asctime)s] %(levelname)s: %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
 
     class _TqdmStream:
-        """ Strumien przekazujacy logi przez tqdm.write, zeby pasek sie nie dublowal. """
         @classmethod
         def write(cls, msg):
-            logger.info(msg.rstrip())
+            if msg.strip():
+                tqdm.write(msg.rstrip())
+        @classmethod
         def flush(cls):
             sys.stdout.flush()
 
-    ch = logging.StreamHandler(_TqdmStream)
+    ch = logging.StreamHandler(_TqdmStream())
     ch.setFormatter(fmt)
     fh = logging.FileHandler("crnn_training.log", encoding="utf-8")
     fh.setFormatter(fmt)
@@ -86,34 +86,12 @@ def setup_logger(name: str = "crnn"):
     logger.addHandler(fh)
     return logger
 
-# Inicjalizacja systemu logowania
-def setup_logger(name="CRNN", level=logging.INFO):
-    class _TqdmStream:
-        def write(self, buf):
-            tqdm.write(buf, end="")
-
-        def flush(self):
-            pass
-
-    logger = logging.getLogger(name)
-    logger.setLevel(level)
-
-    # Używamy instancji _TqdmStream(), żeby logi nie kolidowały z paskiem postępu tqdm
-    handler = logging.StreamHandler(stream=_TqdmStream())
-    handler.setFormatter(
-        logging.Formatter("[%(asctime)s] %(levelname)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
-    )
-
-    if not logger.handlers:
-        logger.addHandler(handler)
-
-    return logger
 
 logger = setup_logger()
 
 
 # Połączenia z infrastrukturą
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # Globalne urządzenie dla całego skryptu
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -484,9 +462,9 @@ def preprocess_raw_ct_to_roi(raw_dir="raw_ct_pngs", out_dir="dataset_efficientne
             'IPH': 'intraparenchymal', 'IVH': 'intraventricular'
         }
         df = df.rename(columns=cq500_to_rsna)
-        
-    except Exception as e:
-        logger.error(f"Nie udało się wczytać etykiet z pliku {labels_file}: {e}")
+
+    except FileNotFoundError:
+        logger.error(f"Nie znaleziono pliku etykiet: {labels_file}")
         return False
 
     label_cols = [c for c in df.columns if c != 'PatientID']
@@ -1036,7 +1014,7 @@ def train_unet_model(raw_dir=None, epochs=3):
     if os.path.exists(model_path):
         logger.info("Znaleziono wytrenowany model UNet. Wczytuję wagi.")
         unet = UNet().to(DEVICE)
-        unet.load_state_dict(torch.load(model_path, map_location=DEVICE))
+        unet.load_state_dict(torch.load(model_path, map_location=DEVICE, weights_only=True))
         return unet
 
     logger.info("Rozpoczynam trening UNet przy użyciu labelingu z OpenCV.")
@@ -1045,7 +1023,7 @@ def train_unet_model(raw_dir=None, epochs=3):
         logger.error("Brak danych do treningu UNet.")
         return None
         
-    dataloader = DataLoader(dataset, batch_size=8, shuffle=True, num_workers=2)
+    dataloader = DataLoader(dataset, batch_size=8, shuffle=True, num_workers=0)
     unet = UNet().to(DEVICE)
     optimizer = optim.Adam(unet.parameters(), lr=1e-3)
     criterion = nn.BCEWithLogitsLoss()
@@ -1200,8 +1178,10 @@ def _run_cross_validation_training(train_raw_dataset, val_raw_dataset, unet_mode
         class_counts = [fold_train_labels.count(0), fold_train_labels.count(1)]
         sample_weights = [1.0 / max(1, class_counts[label]) for label in fold_train_labels]
         sampler = torch.utils.data.WeightedRandomSampler(weights=sample_weights, num_samples=len(sample_weights), replacement=True)
-        
-        train_loader = DataLoader(train_dataset, batch_size=main_batch_size, sampler=sampler, num_workers=4, pin_memory=True, persistent_workers=True)
+
+        """ Trening w pętli walidacji krzyżowej. Wyłączono persistent_workers, zapobiegając szybkiemu zapychaniu RAMu przez procesy w tle,
+            przy kluczowym dla szybkości treningu zachowaniu wielowątkowości. """
+        train_loader = DataLoader(train_dataset, batch_size=main_batch_size, sampler=sampler, num_workers=4, pin_memory=True, persistent_workers=False)
         
         fold_val_labels = [all_labels[i] for i in val_indices]
         val_is_sick = np.array(fold_val_labels)
@@ -1214,9 +1194,9 @@ def _run_cross_validation_training(train_raw_dataset, val_raw_dataset, unet_mode
             pos_sampled = rng_sampler.choice(pos_indices_rel, size=int(n_total * 0.75), replace=True)
             neg_sampled = rng_sampler.choice(neg_indices_rel, size=n_total - int(n_total * 0.75), replace=True)
             val_dataset_oit = torch.utils.data.Subset(val_dataset, np.concatenate([pos_sampled, neg_sampled]))
-            val_loader = DataLoader(val_dataset_oit, batch_size=main_batch_size, shuffle=False, num_workers=4, pin_memory=True, persistent_workers=True)
+            val_loader = DataLoader(val_dataset_oit, batch_size=main_batch_size, shuffle=False, num_workers=4, pin_memory=True, persistent_workers=False)
         else:
-            val_loader = DataLoader(val_dataset, batch_size=main_batch_size, shuffle=False, num_workers=4, pin_memory=True, persistent_workers=True)
+            val_loader = DataLoader(val_dataset, batch_size=main_batch_size, shuffle=False, num_workers=4, pin_memory=True, persistent_workers=False)
 
         imaging_config = MedicalImagingConfig()
         model = VolumetricEfficientNet(imaging_config=imaging_config, backbone='efficientnet')
@@ -1225,9 +1205,11 @@ def _run_cross_validation_training(train_raw_dataset, val_raw_dataset, unet_mode
 
         if hasattr(torch, 'compile') and DEVICE.type == 'cuda':
             try:
-                model = torch.compile(model, mode="reduce-overhead")
-            except Exception:
-                pass
+                model = torch.compile(model, options={"triton.cudagraphs": False})
+            except (RuntimeError, AttributeError) as e:
+                logger.info(f"Kompilacja torch.compile niedostępna. Model działa w trybie Eager. Powód: {e}")
+            except Exception as e:
+                logger.debug(f"Nieoczekiwany błąd podczas torch.compile. Pomijam optymalizację. Szczegóły: {e}")
 
         neg_count = max(1, class_counts[0])
         pos_count = max(1, class_counts[1])
@@ -1235,7 +1217,7 @@ def _run_cross_validation_training(train_raw_dataset, val_raw_dataset, unet_mode
         smooth_w_pos = float(np.clip(np.log1p(raw_w_pos) + 1.0, 1.0, 10.0))
         weights = torch.tensor([1.0, smooth_w_pos], dtype=torch.float32).to(DEVICE)
 
-        criterion = DynamicErrorMarginLoss(base_gamma=1.5)
+        criterion = DynamicErrorMarginLoss(base_gamma=1.5, weight=weights)
         rl_agent = RLAutoAugmentAgent(state_dim=3, action_dim=5, lr=1e-3).to(DEVICE)
         previous_f1, previous_struct_score, previous_sym_score = 0.0, 1.0, 1.0
 
@@ -1325,7 +1307,8 @@ def _run_cross_validation_training(train_raw_dataset, val_raw_dataset, unet_mode
                 else:
                     f1_scores = (2 * precisions[:-1] * recalls[:-1]) / (precisions[:-1] + recalls[:-1] + 1e-10)
                     best_threshold = float(np.clip(thresholds[np.argmax(f1_scores)], 0.1, 0.9))
-            except Exception:
+            except ValueError as e:
+                logger.debug(f"Nie można wyznaczyć krzywej PR (np. brak klasy pozytywnej w próbce). Użyto mediany. Błąd: {e}")
                 best_threshold = float(np.median(all_probs_np)) if len(all_probs_np) > 0 else 0.5
                 
             all_preds = (all_probs_np >= best_threshold).astype(int)
@@ -1344,7 +1327,7 @@ def _run_cross_validation_training(train_raw_dataset, val_raw_dataset, unet_mode
                 best_val_f1 = f1
                 os.makedirs(os.path.join(BASE_DIR, 'output_data', 'Models'), exist_ok=True)
                 torch.save(model._orig_mod.state_dict() if hasattr(model, '_orig_mod') else model.state_dict(), path_main)
-                logger.info(f" ---> Zapisano nowy najlepszy model MAIN (F1: {f1:.3f})")
+                logger.info(f" -> Zapisano nowy najlepszy model MAIN (F1: {f1:.3f})")
                 patience_counter = 0 
             else:
                 patience_counter += 1
@@ -1352,11 +1335,11 @@ def _run_cross_validation_training(train_raw_dataset, val_raw_dataset, unet_mode
             if patience_counter >= patience:
                 current_lr = optimizer.param_groups[0]['lr']
                 if current_lr > 1e-7:
-                    logger.info(f" ---> Redukcja LR. Kontynuacja Fold {fold+1}.")
+                    logger.info(f" -> Redukcja LR. Kontynuacja Fold {fold+1}.")
                     for param_group in optimizer.param_groups: param_group['lr'] *= 0.5
                     patience_counter = 0
                 else:
-                    logger.info(f" ---> Early stopping. Przerywam Fold {fold+1}.")
+                    logger.info(f" -> Early stopping. Przerywam Fold {fold+1}.")
                     break
 
             task_reward = f1 - previous_f1
@@ -1381,7 +1364,7 @@ def _run_fine_tune_phase(path_main: str, path_fine: str, raw_ct_path: str, raw_f
     
     if os.path.exists(raw_ft_path):
         fine_raw_dataset = RawCTVolumeDataset(raw_dir=raw_ft_path, num_slices=30, img_size=224)
-        fine_train_loader = DataLoader(fine_raw_dataset, batch_size=ft_batch_size, shuffle=True, num_workers=2, pin_memory=True) if len(fine_raw_dataset) > 0 else DataLoader(train_raw_dataset, batch_size=ft_batch_size, shuffle=True)
+        fine_train_loader = DataLoader(fine_raw_dataset, batch_size=ft_batch_size, shuffle=True, num_workers=0, pin_memory=True) if len(fine_raw_dataset) > 0 else DataLoader(train_raw_dataset, batch_size=ft_batch_size, shuffle=True)
     else:
         fine_train_loader = DataLoader(train_raw_dataset, batch_size=ft_batch_size, shuffle=True)
         
@@ -1389,7 +1372,7 @@ def _run_fine_tune_phase(path_main: str, path_fine: str, raw_ct_path: str, raw_f
 
     imaging_config = MedicalImagingConfig()
     model = VolumetricEfficientNet(imaging_config=imaging_config, backbone='efficientnet').to(DEVICE)
-    model.load_state_dict(torch.load(path_main, map_location=DEVICE))
+    model.load_state_dict(torch.load(path_main, map_location=DEVICE, weights_only=True))
     
     unet_model = train_unet_model(raw_dir=raw_ct_path)
     
@@ -1472,7 +1455,8 @@ def _run_fine_tune_phase(path_main: str, path_fine: str, raw_ct_path: str, raw_f
                 else:
                     f2_scores = (5 * precisions[:-1] * recalls[:-1]) / (4 * precisions[:-1] + recalls[:-1] + 1e-10)
                     best_threshold = float(np.clip(thresholds[np.argmax(f2_scores)], 0.1, 0.9))
-            except Exception:
+            except ValueError as e:
+                logger.debug(f"Nie można wyznaczyć krzywej PR. Użyto mediany. Błąd: {e}")
                 best_threshold = float(np.median(all_probs_np)) if len(all_probs_np) > 0 else 0.5
                 
             all_preds = (all_probs_np >= best_threshold).astype(int)
@@ -1494,26 +1478,21 @@ def _run_fine_tune_phase(path_main: str, path_fine: str, raw_ct_path: str, raw_f
             best_val_f2 = f2
             torch.save(model.state_dict(), path_fine)
             torch.save(unet_model.state_dict(), os.path.join(BASE_DIR, 'output_data', 'Models', 'unet_corpus_callosum_finetune.pth'))
-            logger.info(f" ---> Zapisano nowe najlepsze złączone wagi kaskady (F2: {f2:.3f})")
+            logger.info(f" -> Zapisano nowe najlepsze złączone wagi kaskady (F2: {f2:.3f})")
 
-    # Po zakończeniu fine tuningu i zapisaniu wag modeli, trenujemy Agenta RL od polityki augmentacji
     val_loader = DataLoader(val_raw_dataset, batch_size=4, shuffle=False)
     
     if os.path.exists(path_main) and os.path.exists(path_fine):
         model_main = VolumetricEfficientNet(imaging_config=MedicalImagingConfig()).to(DEVICE)
-        model_main.load_state_dict(torch.load(path_main, map_location=DEVICE))
+        model_main.load_state_dict(torch.load(path_main, map_location=DEVICE, weights_only=True))
         
         model_fine = VolumetricEfficientNet(imaging_config=MedicalImagingConfig()).to(DEVICE)
-        model_fine.load_state_dict(torch.load(path_fine, map_location=DEVICE))
+        model_fine.load_state_dict(torch.load(path_fine, map_location=DEVICE, weights_only=True))
         
         train_routing_agent(model_main, model_fine, val_loader, thresh_fine=0.50, thresh_main=0.55, epochs=15)
     else:
         logger.warning("Brak kompletnych wag Main/Fine na dysku. Pomijam osobny trening Agenta RL.")
-    
-    # Trening agenta na zbiorze walidacyjnym
-    train_routing_agent(model_main, model_fine, val_loader, thresh_fine=0.50, thresh_main=0.55, epochs=15)
 
-    # Generowanie XAI
     logger.info("Generowanie wizualizacji decyzyjnej XAI dla przykładowego pacjenta.")
     heatmaps_dir = os.path.join(BASE_DIR, 'output_data', 'Models', 'heatmaps_efficientnet')
     os.makedirs(heatmaps_dir, exist_ok=True)
@@ -1549,12 +1528,18 @@ def _run_fine_tune_phase(path_main: str, path_fine: str, raw_ct_path: str, raw_f
             else:
                 img = vol_np
                 
-            img = np.clip(((img * 0.5 + 0.5) * 255), 0, 255).astype(np.uint8)
+            img_uint = np.clip(((img * 0.5 + 0.5) * 255), 0, 255).astype(np.uint8)
             attention_map = (attention_map - attention_map.min()) / (attention_map.max() - attention_map.min() + 1e-5)
             heatmap = cv.applyColorMap(np.uint8(255 * attention_map), cv.COLORMAP_JET)
-            superimposed = cv.addWeighted(cv.cvtColor(img, cv.COLOR_GRAY2BGR), 0.5, heatmap, 0.5, 0)
+            
+            img_bgr = cv.cvtColor(img_uint, cv.COLOR_GRAY2BGR)
+            
+            if heatmap.shape[:2] != img_bgr.shape[:2]:
+                heatmap = cv.resize(heatmap, (img_bgr.shape[1], img_bgr.shape[0]))
+                
+            superimposed = cv.addWeighted(img_bgr, 0.5, heatmap, 0.5, 0)
             cv.imwrite(os.path.join(heatmaps_dir, 'xai_corpus_callosum_overlay.jpg'), superimposed)
-
+            
 
 def train_efficientnet():
     """ Główny orkiestrator kaskady EfficientNet (Optuna -> K-Fold z RL -> Fine Tune). """
