@@ -116,6 +116,11 @@ Furthermore, this architecture is built strictly as a decision support tool. It 
 
 ---
 
+## Data Directory
+> **Note:** The `Data/` folder containing local patient datasets (e.g., MIMIC-IV `chartevents.csv.gz` and preprocessed tensors) is excluded from this repository due to its large size and privacy restrictions. Please ensure you place your local data directory in the root path before running the pipeline. I placed it in Data_TBI folder in Home directory.
+
+---
+
 ## Initialization and Data Download
 
 Downloading the main RSNA archive (~190 GB) by the Kaggle CLI inside Docker's virtual file system causes memory leaks and out of memory crashes. The solution is to perform a native download directly on the host machine, after which the orchestrator automatically detects the downloaded files and processes the remaining datasets.
