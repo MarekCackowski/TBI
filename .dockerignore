@@ -1,15 +1,68 @@
-# Ukryte środowiska
+# Foldery z danymi, pliki wyjściowe i archiwa
+Data/
+**/Data/
+dataset_ct/
+**/dataset_ct/
+output_data/
+**/output_data/
+raw_ct_pngs/
+**/raw_ct_pngs/
+*.zip
+*.tar.gz
+*.rar
+*.7z
+**/*.zip
+**/*.tar.gz
+**/*.rar
+**/*.7z
+
+# Systemy kontroli wersji i środowiska
 .venv
 .venv-1
 .git
+.gitignore
 .vscode
-__pycache__
+__pycache__/
+*.py[cod]
+*$py.class
 
-# Foldery z danymi
-Data/
-dataset_ct/
-output_data/
-raw_ct_pngs/
-
-# Logi
+# Logi i pliki tymczasowe
+*.log
 training.log
+*.tmp
+.DS_Store
+Thumbs.db
+
+# Dokumentacja i pliki konfiguracyjne
+.env
+README.md
+docker-compose.yml
+Dockerfile
+.ipynb_checkpoints/
+**/.ipynb_checkpoints/
+
+# Narzędzia do śledzenia eksperymentów
+wandb/
+**/wandb/
+mlruns/
+**/mlruns/
+runs/
+**/runs/
+
+# Python build / packaging
+build/
+**/build/
+dist/
+**/dist/
+*.egg-info/
+.eggs/
+
+# Caches testów i linterów
+.pytest_cache/
+**/.pytest_cache/
+.mypy_cache/
+**/.mypy_cache/
+.ruff_cache/
+**/.ruff_cache/
+.tox/
+**/.tox/

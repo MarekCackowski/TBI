@@ -69,21 +69,8 @@ services:
         max-file: "3"
 
   # MinIO: przechowywanie danych obrazów i plików
-  #tbi-minio:  # Przy MinIO nie można _, bo w nazwach kontenerów i hostów są problemy z DNS-em, więc używamy myślnika
-    #image: cgr.dev/chainguard/minio:latest # Używamy chainguard, bo oficjalny obraz MinIO ma problemy z DNS-em i nie działa w Docker Compose
-    #container_name: tbi-minio
-    #environment:
-      #MINIO_ROOT_USER: ${MINIO_USER}
-      #MINIO_ROOT_PASSWORD: ${MINIO_PASSWORD}
-    #command: server /data --console-address ":9001"
-    #ports:
-      #- "9002:9000"
-      #- "9003:9001"
-    #volumes:
-      #- minio_data:/data
-    #restart: unless-stopped
   tbi-minio:
-    image: cgr.dev/chainguard/minio:latest # Używamy chainguard, bo oficjalny obraz MinIO ma problemy z DNS-em i nie działa w Docker Compose
+    image: cgr.dev/chainguard/minio:latest
     container_name: tbi-minio
     environment:
       MINIO_ROOT_USER: ${MINIO_USER}
@@ -93,28 +80,29 @@ services:
       - "9002:9000"
       - "9003:9001"
     volumes:
-      - ./local_minio_data:/data
+      - ~/Data_MinIO:/data
     restart: unless-stopped
 
   tbi_app:
     build: .
     container_name: tbi_app
-    shm_size: '16gb' # Zapobiega błędom pamięci współdzielonej DataLoaderów
-    ipc: host # Używamy host dla szybkiej komunikacji procesów i transferu tensorów GPU
+    shm_size: '16gb'
+    ipc: host
     env_file:
       - .env
     volumes:
       - .:/app
-      - ~/.cache/torch:/root/.cache/torch # Kontener zobaczy wagi pobrane na hoście
+      - ~/Data_TBI:/app/Data
+      - ~/.cache/torch:/root/.cache/torch
     depends_on:
       tbi_postgres:
         condition: service_healthy
       tbi_mongo:
         condition: service_healthy
       tbi_redis:
-        condition: service_healthy # Sprawdzamy, czy wszystkie używane bazy danych są gotowe przed uruchomieniem aplikacji TBI
+        condition: service_healthy
       tbi-minio:
-        condition: service_started # MinIO wystartowanie może zająć trochę dłużej, a potrzebujemy go dopiero po 
+        condition: service_started
     deploy:
       resources:
         reservations:
@@ -122,16 +110,16 @@ services:
             - driver: nvidia
               count: all
               capabilities: [gpu]
-    tty: true # Umożliwia interaktywną sesję w kontenerze, np. do debugowania lub uruchamiania skryptów
+    tty: true
     environment:
-      - PYTHONUNBUFFERED=1 # Natychmiastowe logi w konsoli, bez buforowania
-      - TZ=Europe/Warsaw # Stała strefa czasowa dla logów i harmonogramów zadań, żeby uniknąć problemów z czasem letnim/zimowym
+      - PYTHONUNBUFFERED=1
+      - TZ=Europe/Warsaw
     restart: unless-stopped
     logging:
-      driver: "json-file" # Logowanie w formacie JSON, łatwe do analizy i integracji z narzędziami monitorującymi
+      driver: "json-file"
       options:
-        max-size: "50m" # Ogranicza rozmiar pojedynczego pliku logu do 50 MB, aby uniknąć zapełnienia dysku
-        max-file: "3" # Ogranicza liczbę plików logu do 3, aby uniknąć zapełnienia dysku
+        max-size: "50m"
+        max-file: "3"
 
 volumes:
   postgres_data:

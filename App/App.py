@@ -40,14 +40,14 @@ st.markdown("""
 def load_vision_models():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     models = {}
-    
+
     # Model Fine (Wysoka czułość)
     if os.path.exists('output_data/Models/crnn_hemorrhage_fine_best.pth'):
         crnn_fine = VolumetricMedicalResNetCRNN(task='multilabel', num_classes=5).to(device)
         crnn_fine.load_state_dict(torch.load('output_data/Models/crnn_hemorrhage_fine_best.pth', map_location=device))
         crnn_fine.eval()
         models['CRNN_Fine'] = crnn_fine
-        
+
     # Model Main (Wysoka precyzja)
     if os.path.exists('output_data/Models/crnn_hemorrhage_multilabel_best.pth'):
         crnn_main = VolumetricMedicalResNetCRNN(task='multilabel', num_classes=5).to(device)
@@ -57,47 +57,47 @@ def load_vision_models():
     elif 'CRNN_Fine' in models:
         # Fallback jeśli masz tylko jeden model
         models['CRNN_Main'] = models['CRNN_Fine']
-        
+
     if os.path.exists('output_data/Models/capsnet_corpus_callosum_finetune.pth'):
         capsnet = VolumetricCapsNet(num_slices=30, backbone='efficientnet').to(device)
         capsnet.load_state_dict(torch.load('output_data/Models/capsnet_corpus_callosum_finetune.pth', map_location=device))
         capsnet.eval()
         models['CapsNet+UNet'] = capsnet
-        
+
     if os.path.exists('output_data/Models/densenet_fracture_best.pth'):
         densenet = DenseNetFractureDetector(pretrained=False, dropout_rate=0.0).to(device)
         densenet.load_state_dict(torch.load('output_data/Models/densenet_fracture_best.pth', map_location=device))
         densenet.eval()
         models['DenseNet+ViT'] = densenet
-        
+
     return models, device
 
 
 def cascade_crnn_predict(tensor_img, fine_model, main_model, threshold_fine=0.15, threshold_main=0.35):
-    """ Kaskada CRNN (Fine -> Main) z redukcją ryzyka opartą na rozkładzie stochastycznym 
+    """ Kaskada CRNN (Fine -> Main) z redukcją ryzyka opartą na rozkładzie stochastycznym
         w przypadku braku potwierdzenia przez model Main (brak twardego spadku do 0). """
     #  Model Fine (Bramka wstępna)
     with torch.no_grad():
         out_fine = torch.sigmoid(fine_model(tensor_img)).cpu().numpy()
         prob_fine = float(out_fine.max())
-        
+
     # Jeśli model Fine nic nie wykrył poniżej progu czułości
     if prob_fine < threshold_fine:
         # Ryzyko nie spadnie do 0 – losujemy z niskiego rozkładu beta (niepewność resztkowa)
         residual_risk = float(np.clip(np.random.beta(1, 12) * 0.12, 0.01, 0.08))
         return residual_risk, "Odrzucony przez Fine (Niskie ryzyko resztkowe z rozkładu)"
-        
+
     # Model Main (Wysoka precyzja)
     with torch.no_grad():
         out_main = torch.sigmoid(main_model(tensor_img)).cpu().numpy()
         prob_main = float(out_main.max())
-        
+
     # Jeśli Fine sygnalizował zagrożenie, ale Main odrzuca (uznaje za fałszywy alarm)
     if prob_main < threshold_main:
         # Zmniejszamy ryzyko, ale nie do zera, uwzględniamy pierwotną wątpliwość modelu Fine przez rozkład brzegowy
         residual_risk = float(np.clip(prob_fine * 0.3 + np.random.normal(0.04, 0.015), 0.03, 0.25))
         return residual_risk, "Fine ostrzegał, Main odrzucił (Zredukowane ryzyko stochastyczne)"
-        
+
     # Oba modele potwierdzają patologię (lub Main podtrzymuje wysokie ryzyko)
     final_prob = max(prob_main, prob_fine * 0.9)
     return final_prob, "Potwierdzone przez Kaskadę (Main + Fine)"
@@ -158,20 +158,20 @@ class MedicalCascadePredictor:
         self.judge = judge
         self.anomaly_detector = anomaly_detector
         self.feature_names_in = preprocessor.feature_names_in_
-        
+
     def predict_proba(self, X_raw, crnn_probs=None, capsnet_probs=None, densenet_probs=None):
         if not isinstance(X_raw, pd.DataFrame):
             X_raw = pd.DataFrame(X_raw, columns=self.feature_names_in)
         X_clean = self.preprocessor.transform(X_raw)
         feature_names_out = [name.split('__')[-1] for name in self.preprocessor.get_feature_names_out()]
         X_clean_df = pd.DataFrame(X_clean, columns=feature_names_out, index=X_raw.index)
-        
+
         if hasattr(self.ensemble, 'feature_names_in_'):
             X_clean_df = X_clean_df[self.ensemble.feature_names_in_]
 
         prob_main = self.ensemble.predict_proba(X_clean_df)[:, 1]
         final_probs = prob_main.copy()
-        
+
         is_uncertain = (prob_main > 0.35) & (prob_main < 0.65)
         is_anomalous = (self.anomaly_detector.predict(X_clean_df) == 1) if self.anomaly_detector else pd.Series(False, index=X_raw.index)
         is_hard_case = is_uncertain | is_anomalous
@@ -180,19 +180,19 @@ class MedicalCascadePredictor:
             X_hard = X_raw[is_hard_case].copy()
             X_hard['model_1_prob'] = prob_main[is_hard_case]
             prob_spec = self.specialist.predict_proba(X_hard)[:, 1]
-            
+
             # Uwzględnienie wyników modeli wizyjnych u Sędziego
             c_crnn = crnn_probs[is_hard_case] if crnn_probs is not None else np.full(is_hard_case.sum(), 0.5)
             c_caps = capsnet_probs[is_hard_case] if capsnet_probs is not None else np.full(is_hard_case.sum(), 0.5)
             c_dense = densenet_probs[is_hard_case] if densenet_probs is not None else np.full(is_hard_case.sum(), 0.5)
-            
+
             meta_features = np.column_stack((prob_main[is_hard_case], prob_spec, c_crnn, c_caps, c_dense))
-            
+
             expected_feats = getattr(self.judge, 'n_features_in_', meta_features.shape[1])
             if meta_features.shape[1] < expected_feats:
                 pad = np.full((meta_features.shape[0], expected_feats - meta_features.shape[1]), 0.5)
                 meta_features = np.column_stack((meta_features, pad))
-                
+
             prob_final_hard = self.judge.predict_proba(meta_features)[:, 1]
             diff = prob_main - 0.5
             weight = 1 / (1 + np.exp(-10 * diff))
@@ -202,11 +202,11 @@ class MedicalCascadePredictor:
 
 
 def save_multimodal_feedback(patient_id, patient_data, cv_errors, tabular_errors, global_outcome, comment):
-    """ Zapisuje wielowymiarową korektę lekarza obejmującą błędy wizyjne, 
+    """ Zapisuje wielowymiarową korektę lekarza obejmującą błędy wizyjne,
         tabelaryczne oraz tekstowe do bazy Active Learning. """
     feedback_path = "output_data/multimodal_active_learning_queue.csv"
     os.makedirs(os.path.dirname(feedback_path), exist_ok=True)
-    
+
     # Określenie poprawnej etykiety globalnej
     if "zgodny" in global_outcome or "przeżył" in global_outcome:
         true_label = 0
@@ -226,14 +226,14 @@ def save_multimodal_feedback(patient_id, patient_data, cv_errors, tabular_errors
         record[k] = v[0] if isinstance(v, list) else v
 
     df_record = pd.DataFrame([record])
-    
+
     if os.path.exists(feedback_path):
         df_existing = pd.read_csv(feedback_path)
         df_combined = pd.concat([df_existing, df_record], ignore_index=True)
         df_combined.to_csv(feedback_path, index=False)
     else:
         df_record.to_csv(feedback_path, index=False)
-        
+
     logger.info(f"Zapisano wielowymiarową korektę dla pacjenta {patient_id}. CV: {cv_errors}, Tab: {tabular_errors}")
 
 
@@ -250,14 +250,14 @@ with col_input:
         st.markdown("**Dane Demograficzne**")
         age = st.number_input("Wiek", 18, 120, 65)
         neuro_deficit = st.selectbox("Deficyt neurologiczny w wywiadzie", ["Nie", "Tak"])
-        
+
         st.markdown("**Skala Glasgow (GCS)**")
         gcs_eyes = st.slider("Reakcja oczu (1-4)", 1, 4, 3)
         gcs_verbal = st.slider("Reakcja słowna (1-5)", 1, 5, 4)
         gcs_motor = st.slider("Reakcja ruchowa (1-6)", 1, 6, 5)
         is_intubated = st.checkbox("Pacjent zaintubowany")
         is_sedated = st.checkbox("Pacjent pod wpływem sedacji farmakologicznej")
-        
+
         st.markdown("**Hemodynamika (Najgorsze wyniki 24h)**")
         sysbp_min = st.number_input("Najniższe ciśnienie skurczowe (mmHg)", 40, 250, 100)
         diasbp_min = st.number_input("Najniższe ciśnienie rozkurczowe (mmHg)", 20, 150, 60)
@@ -277,7 +277,7 @@ if submit:
     else:
         with col_results:
             st.subheader("Przepływ Kaskadowy w Systemie CDSS")
-            
+
             with st.status("Przetwarzanie wielomodalne w 3 fazach...", expanded=True) as status:
                 st.write("--- FAZA 1: Model Drzewiasty (Triage tabelaryczny) ---")
                 gcs_sum = gcs_eyes + gcs_motor + (0 if is_intubated else gcs_verbal)
@@ -323,16 +323,16 @@ if submit:
                     img_pil = Image.open(uploaded_image).convert('RGB')
                     tfms = transforms.Compose([transforms.Resize((160, 160)), transforms.ToImage(), transforms.ToDtype(torch.float32, scale=True)])
                     tensor_img = tfms(img_pil).unsqueeze(0).unsqueeze(0).to(pt_device)
-                    
+
                     if tensor_img.shape[2] == 3:
                         crnn_prob, _ = cascade_crnn_predict(tensor_img, vision_models['CRNN_Fine'], vision_models['CRNN_Main'])
                         capsnet_prob = float(torch.sigmoid(vision_models['CapsNet+UNet'](tensor_img.mean(dim=1))).max().cpu().numpy()) if 'CapsNet+UNet' in vision_models else 0.4
                         densenet_prob = float(torch.sigmoid(vision_models['DenseNet+ViT'](tensor_img[:,:,0,:,:])).max().cpu().numpy()) if 'DenseNet+ViT' in vision_models else 0.3
 
                 final_prob = float(np.clip(cascade_model.predict_proba(
-                    df_patient, 
-                    crnn_probs=np.array([crnn_prob]), 
-                    capsnet_probs=np.array([capsnet_prob]), 
+                    df_patient,
+                    crnn_probs=np.array([crnn_prob]),
+                    capsnet_probs=np.array([capsnet_prob]),
                     densenet_probs=np.array([densenet_prob])
                 )[0, 1] + space_risk_factor, 0.01, 0.99))
 
@@ -343,18 +343,18 @@ if submit:
             m1, m2, m3 = st.columns(3)
             m1.metric("Skorygowany GCS", gcs_sum)
             m2.metric(
-                "Ryzyko Wizualne (CRNN)", 
+                "Ryzyko Wizualne (CRNN)",
                 f"{crnn_prob*100:.1f}%",
                 help=f"crnn result: {crnn_prob:.3f} | crnn+capsnet result: {np.mean([crnn_prob, capsnet_prob]):.3f} | final result: {final_prob:.3f}"
             )
             m3.metric(
-                "OSTATECZNE RYZYKO (FAZA 1-3)", 
-                f"{final_prob*100:.1f}%", 
-                delta="KRYTYCZNE" if final_prob >= 0.5 else "STABILNE", 
+                "OSTATECZNE RYZYKO (FAZA 1-3)",
+                f"{final_prob*100:.1f}%",
+                delta="KRYTYCZNE" if final_prob >= 0.5 else "STABILNE",
                 delta_color="inverse",
                 help=f"crnn result: {crnn_prob:.3f} | crnn+capsnet result: {np.mean([crnn_prob, capsnet_prob]):.3f} | final result: {final_prob:.3f}"
             )
-            
+
             # --- Zintegrowane podświetlenie niepewnych fragmentów tekstu z tooltipami modeli ---
             st.markdown(
                 f"""
@@ -390,17 +390,17 @@ if submit:
                 """,
                 unsafe_allow_html=True
             )
-            
+
             if final_prob >= 0.5:
                 st.error("Próg krytyczny F-Beta przekroczony. Wymagana natychmiastowa konsultacja neurochirurgiczna!")
             else:
                 st.success("Pacjent hemodynamicznie i strukturalnie stabilny w obecnym oknie czasowym.")
-            
+
             # --- SEKCJA 1: Wyjaśnialność AI: Dynamiczna analiza z modeli i bazy ---
             st.markdown("---")
             st.subheader("Moduł Wyjaśnialności i Synergii Wielomodalnej (XAI)")
             col_xai1, col_xai2 = st.columns(2)
-            
+
             with col_xai1:
                 st.markdown("**Analiza SHAP (Wpływ cech dla pacjenta - Faza 1)**")
                 try:
@@ -409,11 +409,11 @@ if submit:
                     X_clean_df = pd.DataFrame(X_clean_arr, columns=feat_out)
                     if hasattr(cascade_model.ensemble, 'feature_names_in_'):
                         X_clean_df = X_clean_df[cascade_model.ensemble.feature_names_in_]
-                        
+
                     xgb_model = cascade_model.ensemble.estimators_[0]
                     explainer = shap.TreeExplainer(xgb_model)
                     shap_values = explainer.shap_values(X_clean_df)
-                    
+
                     fig, ax = plt.subplots(figsize=(6, 4))
                     s_vals = shap_values[0] if isinstance(shap_values, list) else shap_values[0]
                     exp_val = explainer.expected_value[0] if isinstance(explainer.expected_value, (list, np.ndarray)) else explainer.expected_value
@@ -441,7 +441,7 @@ if submit:
                             ax.set_xlabel("ID wpisu w bazie")
                             ax.set_title("Rozkład etykiet w bazie Active Learning")
                             modalities = ['Tabelaryczne', 'CRNN', 'CapsNet+UNet', 'DenseNet+ViT']
-                            probs = [float(cascade_model.ensemble.predict_proba(X_clean_df)[0, 1]) if 'X_clean_df' in locals() else float(final_prob), 
+                            probs = [float(cascade_model.ensemble.predict_proba(X_clean_df)[0, 1]) if 'X_clean_df' in locals() else float(final_prob),
                                      float(crnn_prob), float(capsnet_prob), float(densenet_prob)]
                             ax.bar(modalities, probs, color=['#007bff', '#28a745', '#ffc107', '#dc3545'])
                             ax.set_ylim(0, 1.0)
@@ -471,7 +471,7 @@ if submit:
             # --- SEKCJA 2: Neural ODE oraz GNN Graph Rx (Dynamiczne z bazy i modeli) ---
             st.markdown("---")
             col_ode, col_gnn = st.columns(2)
-            
+
             # Wczytywanie danych historycznych z bazy Active Learning do kalibracji symulacji
             db_path = "output_data/multimodal_active_learning_queue.csv"
             historical_volatility = 0.05
@@ -486,16 +486,16 @@ if submit:
             with col_ode:
                 st.subheader("Symulacja Trajektorii Czasowej (Neural ODE)")
                 st.caption(f"Kalibracja na bazie historycznej OIT (Wskaźnik zmienności: {historical_volatility:.3f})")
-                
+
                 scenario = "sudden_hematoma" if final_prob >= 0.5 else "stable_recovery"
                 simulated_events = generate_icu_clinical_scenario(scenario_name=scenario, duration_hours=24)
                 bayesian_monitor = BayesianTrajectoryMonitor(initial_prob=final_prob, patient_age=age)
-                
+
                 probs_over_time = [final_prob * 100]
                 for vitals in simulated_events:
                     adjusted_vitals = {k: v * (1.0 + historical_volatility * 0.1) for k, v in vitals.items()} if isinstance(vitals, dict) else vitals
                     probs_over_time.append(bayesian_monitor.update_belief(adjusted_vitals) * 100)
-                    
+
                 chart_df = pd.DataFrame(probs_over_time, columns=['Ryzyko Pogorszenia (%)'])
                 chart_df.index.name = "Godziny na OIT"
                 st.line_chart(chart_df, color="#ff4b4b" if scenario == "sudden_hematoma" else "#2e7d32")
@@ -503,7 +503,7 @@ if submit:
             with col_gnn:
                 st.subheader("Wykrywanie Pułapok Farmakologicznych (GNN)")
                 st.caption("Grafowa analiza relacji leków i telemetrii OIT.")
-                
+
                 # Dynamiczna analiza bazy pod kątem statystyk historii pacjentów
                 if os.path.exists(db_path):
                     try:
@@ -531,7 +531,7 @@ if submit:
             # --- SEKCJA 3: Panel HITL z dynamicznymi statystykami z bazy ---
             st.divider()
             st.subheader("Multimodalny Panel Audytu i Korekty Błędów AI")
-            
+
             if os.path.exists(db_path):
                 try:
                     df_stats = pd.read_csv(db_path)
@@ -540,10 +540,10 @@ if submit:
                     st.info("Wskaź, w którym elemencie system popełnił błąd. Informacje te zasilą pętlę uczenia aktywnego.")
             else:
                 st.info("Wskaź, w którym elemencie system popełnił błąd. Informacje te zasilą pętlę uczenia aktywnego.")
-            
+
             with st.form(key='multimodal_hitl_form'):
                 col_m1, col_m2, col_m3 = st.columns(3)
-                
+
                 with col_m1:
                     st.markdown("**Audyt Modeli Wizyjnych**")
                     cv_err = st.multiselect("Zaznacz błędy sieci 3D:", [
@@ -553,7 +553,7 @@ if submit:
                         "DenseNet+Tr: Przeoczył złamanie kości czaszki/szyi",
                         "Wizualizacje poprawne / brak zastrzeżeń"
                     ])
-                    
+
                 with col_m2:
                     st.markdown("**Audyt Danych Tabelarycznych**")
                     tab_err = st.multiselect("Zaznacz anomalie w tabeli:", [
@@ -562,7 +562,7 @@ if submit:
                         "Zaniżone lub pominięte kluczowe pomiary z 24h",
                         "Parametry tabelaryczne poprawne"
                     ])
-                    
+
                 st.markdown("---")
                 col_g1, col_g2 = st.columns([1, 1])
                 with col_g1:
@@ -573,9 +573,9 @@ if submit:
                     ])
                 with col_g2:
                     doc_comment = st.text_area("Szczegółowy komentarz lekarski (do raportu i Active Learning):")
-                
+
                 submit_audit = st.form_submit_button("Zapisz Korektę w Bazie i Zaktualizuj Pętlę AI", type="primary")
-                
+
                 if submit_audit:
                     save_multimodal_feedback(
                         patient_id="PT-DYNAMIC-01",

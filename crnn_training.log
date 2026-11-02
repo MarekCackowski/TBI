@@ -1,0 +1,44 @@
+[2026-10-29 02:33:31] INFO: Brakuje plików wag. Uruchamianie głównego treningu kaskady.
+[2026-10-29 02:33:31] INFO: Uruchamianie kaskady na urządzeniu: cuda
+[2026-10-29 02:33:31] INFO: Rozpoczynam trening UNet przy użyciu labelingu z OpenCV.
+[2026-10-29 02:35:53] INFO:  -> Zapisano ostateczne wagi modelu UNet.
+[2026-10-29 02:35:53] INFO: Znaleziono gotowe pola ROI w '/app/Data/dataset_efficientnet'.
+[2026-10-29 02:35:53] INFO: Optymalizacja Bayesowska hiperparametrów dla EfficientNet.
+[2026-10-29 14:32:13] INFO: Brakuje plików wag. Uruchamianie głównego treningu kaskady.
+[2026-10-29 14:32:13] INFO: Uruchamianie kaskady na urządzeniu: cuda
+[2026-10-29 14:32:13] INFO: Rozpoczynam trening UNet przy użyciu labelingu z OpenCV.
+[2026-10-29 14:34:42] INFO:  -> Zapisano ostateczne wagi modelu UNet.
+[2026-10-29 14:34:42] INFO: Znaleziono gotowe pola ROI w '/app/Data/dataset_efficientnet'.
+[2026-10-29 14:34:42] INFO: Optymalizacja Bayesowska hiperparametrów dla EfficientNet.
+[2026-10-30 00:20:27] INFO: Brakuje plików wag. Uruchamianie głównego treningu kaskady.
+[2026-10-30 00:20:27] INFO: Uruchamianie kaskady na urządzeniu: cuda
+[2026-10-30 00:20:27] INFO: Rozpoczynam trening UNet przy użyciu labelingu z OpenCV.
+[2026-10-30 00:22:52] INFO:  -> Zapisano ostateczne wagi modelu UNet.
+[2026-10-30 00:22:52] INFO: Znaleziono gotowe pola ROI w '/app/Data/dataset_efficientnet'.
+[2026-10-30 00:22:52] INFO: Optymalizacja Bayesowska hiperparametrów dla EfficientNet.
+[2026-10-31 03:43:20] INFO: Brakuje plików wag. Uruchamianie głównego treningu kaskady.
+[2026-10-31 03:43:20] INFO: Uruchamianie kaskady na urządzeniu: cuda
+[2026-10-31 03:43:20] INFO: Rozpoczynam trening UNet przy użyciu labelingu z OpenCV.
+[2026-10-31 03:45:45] INFO:  -> Zapisano ostateczne wagi modelu UNet.
+[2026-10-31 03:45:45] INFO: Znaleziono gotowe pola ROI w '/app/Data/dataset_efficientnet'.
+[2026-10-31 03:45:45] INFO: Optymalizacja Bayesowska hiperparametrów dla EfficientNet.
+[2026-10-31 05:53:04] INFO: Brakuje plików wag. Uruchamianie głównego treningu kaskady.
+[2026-10-31 05:53:04] INFO: Uruchamianie kaskady na urządzeniu: cuda
+[2026-10-31 05:53:04] INFO: Znaleziono wytrenowany model UNet. Wczytuję wagi.
+[2026-10-31 05:53:04] INFO: Znaleziono gotowe pola ROI w '/app/Data/dataset_efficientnet'.
+[2026-10-31 05:53:04] INFO: Optymalizacja Bayesowska hiperparametrów dla EfficientNet.
+[2026-10-31 06:36:20] INFO: Brakuje plików wag. Uruchamianie głównego treningu kaskady.
+[2026-10-31 06:36:20] INFO: Uruchamianie kaskady na urządzeniu: cuda
+[2026-10-31 06:36:20] INFO: Znaleziono wytrenowany model UNet. Wczytuję wagi.
+[2026-10-31 06:36:20] INFO: Znaleziono gotowe pola ROI w '/app/Data/dataset_efficientnet'.
+[2026-10-31 06:36:20] INFO: Optymalizacja Bayesowska hiperparametrów dla EfficientNet.
+[2026-10-31 09:16:49] INFO: Brakuje plików wag. Uruchamianie głównego treningu kaskady.
+[2026-10-31 09:16:49] INFO: Uruchamianie kaskady na urządzeniu: cuda
+[2026-10-31 09:16:49] INFO: Znaleziono wytrenowany model UNet. Wczytuję wagi.
+[2026-10-31 09:16:50] INFO: Znaleziono gotowe pola ROI w '/app/Data/dataset_efficientnet'.
+[2026-10-31 09:16:50] INFO: Optymalizacja Bayesowska hiperparametrów dla EfficientNet.
+[2026-10-31 13:34:51] INFO: Brakuje plików wag. Uruchamianie głównego treningu kaskady.
+[2026-10-31 13:34:51] INFO: Uruchamianie kaskady na urządzeniu: cuda
+[2026-10-31 13:34:52] INFO: Znaleziono wytrenowany model UNet. Wczytuję wagi.
+[2026-10-31 13:34:52] INFO: Znaleziono gotowe pola ROI w '/app/Data/dataset_efficientnet'.
+[2026-10-31 13:34:52] INFO: Optymalizacja Bayesowska hiperparametrów dla EfficientNet.
